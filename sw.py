@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import os
+import inspect
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, TypeVar
 
@@ -83,6 +84,14 @@ def deg(v: float) -> float:
     return math.radians(float(v))
 
 
+def m0(obj: Any, name: str) -> Any:
+    """Call a parameterless API method. Under late binding pywin32 often
+    resolves these (GetTitle, FirstFeature, ...) to their value instead of a
+    method, so call only when it is actually a method."""
+    attr = getattr(obj, name)
+    return attr() if inspect.isroutine(attr) else attr
+
+
 # --- Connection -----------------------------------------------------------
 
 _app: Any = None
@@ -98,7 +107,7 @@ def app() -> Any:
 
     if _app is not None:
         try:
-            _app.RevisionNumber()
+            m0(_app, "RevisionNumber")
             return _app
         except Exception:
             _app = None
@@ -116,9 +125,9 @@ def active_doc(kind: int | None = None) -> Any:
     doc = app().ActiveDoc
     if doc is None:
         raise RuntimeError("No document is open in SOLIDWORKS")
-    if kind is not None and doc.GetType() != kind:
+    if kind is not None and m0(doc, "GetType") != kind:
         raise RuntimeError(
-            f"Active document is a {DOC_TYPE_NAMES.get(doc.GetType(), '?')}, "
+            f"Active document is a {DOC_TYPE_NAMES.get(m0(doc, 'GetType'), '?')}, "
             f"this needs a {DOC_TYPE_NAMES[kind]}"
         )
     return doc
@@ -126,10 +135,10 @@ def active_doc(kind: int | None = None) -> Any:
 
 def doc_info(doc: Any) -> dict:
     return {
-        "title": doc.GetTitle(),
-        "path": doc.GetPathName() or None,
-        "type": DOC_TYPE_NAMES.get(doc.GetType(), "?"),
-        "unsaved_changes": bool(doc.GetSaveFlag()),
+        "title": m0(doc, "GetTitle"),
+        "path": m0(doc, "GetPathName") or None,
+        "type": DOC_TYPE_NAMES.get(m0(doc, "GetType"), "?"),
+        "unsaved_changes": bool(m0(doc, "GetSaveFlag")),
     }
 
 
@@ -137,10 +146,10 @@ def doc_info(doc: Any) -> dict:
 
 
 def iter_features(doc: Any):
-    f = doc.FirstFeature()
+    f = m0(doc, "FirstFeature")
     while f is not None:
         yield f
-        f = f.GetNextFeature()
+        f = m0(f, "GetNextFeature")
 
 
 def feature(doc: Any, name: str) -> Any:
@@ -156,7 +165,7 @@ def last_feature_of_type(doc: Any, type_name: str) -> Any:
         f = doc.FeatureByPositionReverse(i)
         if f is None:
             raise LookupError(f"Document has no {type_name} feature")
-        if f.GetTypeName2() == type_name:
+        if m0(f, "GetTypeName2") == type_name:
             return f
         i += 1
 
@@ -164,7 +173,7 @@ def last_feature_of_type(doc: Any, type_name: str) -> Any:
 def standard_planes(doc: Any) -> dict[str, Any]:
     """The default Front/Top/Right planes, found by position rather than name
     because their names are localized (e.g. 정면/윗면/우측면 in Korean)."""
-    planes = [f for f in iter_features(doc) if f.GetTypeName2() == "RefPlane"][:3]
+    planes = [f for f in iter_features(doc) if m0(f, "GetTypeName2") == "RefPlane"][:3]
     if len(planes) < 3:
         raise RuntimeError("Could not find the three default planes")
     return dict(zip(("front", "top", "right"), planes))

@@ -62,7 +62,7 @@ def _feature_result(feat: Any, what: str) -> dict:
             f"SOLIDWORKS did not create the {what}. Check the selection/geometry "
             "(screenshot, list_features) or build it with run_api_script."
         )
-    return {"feature": feat.Name, "type": feat.GetTypeName2()}
+    return {"feature": feat.Name, "type": sw.m0(feat, "GetTypeName2")}
 
 
 # --- Session and documents ------------------------------------------------
@@ -73,13 +73,13 @@ def status() -> dict:
     """SOLIDWORKS version and the active document, if any."""
     app = sw.app()
     doc = app.ActiveDoc
-    return {"revision": app.RevisionNumber(), "active_document": sw.doc_info(doc) if doc else None}
+    return {"revision": sw.m0(app, "RevisionNumber"), "active_document": sw.doc_info(doc) if doc else None}
 
 
 @tool
 def list_documents() -> list[dict]:
     """All documents currently open in SOLIDWORKS."""
-    docs = sw.app().GetDocuments() or ()
+    docs = sw.m0(sw.app(), "GetDocuments") or ()
     return [sw.doc_info(d) for d in docs]
 
 
@@ -129,7 +129,7 @@ def save(path: str = "") -> dict:
     if path:
         ok = doc.Extension.SaveAs3(str(Path(path)), 0, 1, sw.nothing(), sw.nothing(), errors, warnings)
     else:
-        if not doc.GetPathName():
+        if not sw.m0(doc, "GetPathName"):
             raise ValueError("Document was never saved; give a path")
         ok = doc.Save3(1, errors, warnings)
     if not ok:
@@ -156,12 +156,12 @@ def close_document(title: str = "", discard_changes: bool = False) -> str:
     """Close a document (default: the active one). Refuses if it has unsaved
     changes unless discard_changes=true."""
     app = sw.app()
-    doc = sw.active_doc() if not title else next((d for d in (app.GetDocuments() or ()) if d.GetTitle() == title), None)
+    doc = sw.active_doc() if not title else next((d for d in (sw.m0(app, "GetDocuments") or ()) if sw.m0(d, "GetTitle") == title), None)
     if doc is None:
         raise LookupError(f"No open document titled {title!r}")
-    if doc.GetSaveFlag() and not discard_changes:
+    if sw.m0(doc, "GetSaveFlag") and not discard_changes:
         raise RuntimeError("Document has unsaved changes: save first or pass discard_changes=true")
-    name = doc.GetTitle()
+    name = sw.m0(doc, "GetTitle")
     app.CloseDoc(name)
     return f"closed {name}"
 
@@ -182,14 +182,14 @@ def list_features(include_hidden: bool = False) -> list[dict]:
     }
     out = []
     for f in sw.iter_features(sw.active_doc()):
-        t = f.GetTypeName2()
+        t = sw.m0(f, "GetTypeName2")
         if include_hidden or t not in hidden:
-            out.append({"name": f.Name, "type": t, "suppressed": bool(f.IsSuppressed())})
+            out.append({"name": f.Name, "type": t, "suppressed": bool(sw.m0(f, "IsSuppressed"))})
     return out
 
 
 def _dim_value(dim: Any) -> tuple[float, str]:
-    if dim.GetType() == 2:  # swDimensionParamTypeDoubleAngular
+    if sw.m0(dim, "GetType") == 2:  # swDimensionParamTypeDoubleAngular
         return round(math.degrees(dim.SystemValue), 6), "deg"
     return round(dim.SystemValue / MM, 6), "mm"
 
@@ -202,7 +202,7 @@ def list_dimensions(feature: str = "") -> list[dict]:
     feats = [sw.feature(doc, feature)] if feature else list(sw.iter_features(doc))
     out = []
     for f in feats:
-        dd = f.GetFirstDisplayDimension()
+        dd = sw.m0(f, "GetFirstDisplayDimension")
         while dd is not None:
             dim = dd.GetDimension2(0)
             value, unit = _dim_value(dim)
@@ -216,10 +216,10 @@ def model_info() -> dict:
     """Mass properties, bounding box and material of the active part or
     assembly (mass uses the assigned material's density)."""
     doc = sw.active_doc()
-    if doc.GetType() == DOC_DRAWING:
+    if sw.m0(doc, "GetType") == DOC_DRAWING:
         raise RuntimeError("model_info needs a part or assembly")
     info: dict = {"document": sw.doc_info(doc)}
-    mp = doc.Extension.CreateMassProperty()
+    mp = sw.m0(doc.Extension, "CreateMassProperty")
     if mp is not None:
         info.update(
             mass_kg=round(mp.Mass, 6),
@@ -228,7 +228,7 @@ def model_info() -> dict:
             density_kg_m3=round(mp.Density, 3),
             center_of_mass_mm=[round(v / MM, 4) for v in mp.CenterOfMass],
         )
-    if doc.GetType() == DOC_PART:
+    if sw.m0(doc, "GetType") == DOC_PART:
         box = doc.GetPartBox(True)
         if box:
             info["bounding_box_mm"] = {"min": [round(v / MM, 4) for v in box[:3]], "max": [round(v / MM, 4) for v in box[3:]]}
@@ -246,11 +246,11 @@ def screenshot(view: Literal["current", "front", "back", "left", "right", "top",
     from PIL import Image as PILImage
 
     doc = sw.active_doc()
-    if view != "current" and doc.GetType() != DOC_DRAWING:
+    if view != "current" and sw.m0(doc, "GetType") != DOC_DRAWING:
         doc.ShowNamedView2("", VIEWS[view])
     if zoom_to_fit:
-        doc.ViewZoomtofit2()
-    doc.GraphicsRedraw2()
+        sw.m0(doc, "ViewZoomtofit2")
+    sw.m0(doc, "GraphicsRedraw2")
     with tempfile.TemporaryDirectory() as tmp:
         bmp = os.path.join(tmp, "view.bmp")
         if not doc.SaveBMP(bmp, 1280, 960) or not os.path.exists(bmp):
@@ -259,7 +259,7 @@ def screenshot(view: Literal["current", "front", "back", "left", "right", "top",
         img.thumbnail((1280, 1280))
         buf = io.BytesIO()
         img.save(buf, "JPEG", quality=85)
-    return [f"{doc.GetTitle()} ({view})", Image(data=buf.getvalue(), format="jpeg")]
+    return [f"{sw.m0(doc, 'GetTitle')} ({view})", Image(data=buf.getvalue(), format="jpeg")]
 
 
 # --- Editing --------------------------------------------------------------
@@ -273,7 +273,7 @@ def set_dimension(name: str, value: float) -> dict:
     dim = doc.Parameter(name)
     if dim is None:
         raise LookupError(f"No dimension {name!r}; use list_dimensions")
-    dim.SystemValue = deg(value) if dim.GetType() == 2 else mm(value)
+    dim.SystemValue = deg(value) if sw.m0(dim, "GetType") == 2 else mm(value)
     _rebuild(doc)
     new, unit = _dim_value(dim)
     return {"name": name, "value": new, "unit": unit}
@@ -310,7 +310,7 @@ def suppress_feature(name: str, suppress: bool = True) -> str:
     doc = sw.active_doc()
     doc.ClearSelection2(True)
     sw.select_feature(doc, name)
-    ok = doc.EditSuppress2() if suppress else doc.EditUnsuppress2()
+    ok = sw.m0(doc, "EditSuppress2") if suppress else sw.m0(doc, "EditUnsuppress2")
     if not ok:
         raise RuntimeError(f"Could not change suppression of {name!r}")
     _rebuild(doc)
@@ -327,7 +327,7 @@ def set_material(material: str, database: str = "SOLIDWORKS Materials") -> dict:
     applied = doc.GetMaterialPropertyName2("", db)
     if applied != material:
         raise LookupError(f"Material {material!r} not found in {database!r}")
-    return {"material": applied, "density_kg_m3": round(doc.Extension.CreateMassProperty().Density, 3)}
+    return {"material": applied, "density_kg_m3": round(sw.m0(doc.Extension, "CreateMassProperty").Density, 3)}
 
 
 @tool
@@ -337,7 +337,7 @@ def custom_properties(set_values: dict[str, str] | None = None) -> dict[str, str
     cpm = sw.active_doc().Extension.CustomPropertyManager("")
     for k, v in (set_values or {}).items():
         cpm.Add3(k, 30, str(v), 2)  # text, replace existing
-    return {n: cpm.Get(n) for n in (cpm.GetNames() or ())}
+    return {n: cpm.Get(n) for n in (sw.m0(cpm, "GetNames") or ())}
 
 
 # --- Part modelling -------------------------------------------------------
@@ -494,7 +494,7 @@ def insert_component(path: str, position: list[float] | None = None) -> dict:
     """Insert a part/assembly file into the active assembly at [x,y,z] mm."""
     app = sw.app()
     asm = sw.active_doc(DOC_ASSEMBLY)
-    asm_title = asm.GetTitle()
+    asm_title = sw.m0(asm, "GetTitle")
     ext = Path(path).suffix.lower()
     if ext not in (".sldprt", ".sldasm"):
         raise ValueError("Component must be a .sldprt or .sldasm file")
@@ -514,7 +514,7 @@ def list_components(top_level_only: bool = True) -> list[dict]:
     """Components of the active assembly."""
     asm = sw.active_doc(DOC_ASSEMBLY)
     return [
-        {"name": c.Name2, "path": c.GetPathName(), "suppressed": bool(c.IsSuppressed()), "fixed": bool(c.IsFixed())}
+        {"name": c.Name2, "path": sw.m0(c, "GetPathName"), "suppressed": bool(sw.m0(c, "IsSuppressed")), "fixed": bool(sw.m0(c, "IsFixed"))}
         for c in (asm.GetComponents(top_level_only) or ())
     ]
 
@@ -546,7 +546,7 @@ def add_mate(
     feat = asm.AddMate5(MATES[mate], ALIGN[align], flip, dist, dist, dist, 1, 1, ang, ang, ang, False, False, 0, err)
     if feat is None:
         raise RuntimeError(f"Mate failed (swAddMateError {err.value})")
-    asm.EditRebuild3()
+    sw.m0(asm, "EditRebuild3")
     return {"mate": feat.Name}
 
 
@@ -561,7 +561,7 @@ def make_drawing(model_path: str = "", projection: Literal["third_angle", "first
     app = sw.app()
     if not model_path:
         src = sw.active_doc()
-        model_path = src.GetPathName()
+        model_path = sw.m0(src, "GetPathName")
         if not model_path:
             raise RuntimeError("Save the model first; a drawing references the model file")
     template = app.GetUserPreferenceStringValue(sw.TEMPLATE_PREF[DOC_DRAWING])
@@ -585,14 +585,15 @@ def make_drawing(model_path: str = "", projection: Literal["third_angle", "first
 def run_api_script(code: str) -> dict:
     """Run Python against the live SOLIDWORKS API for anything the other
     tools do not cover. Available names: swApp, doc (active document or
-    None), mm (0.001), deg (degrees -> radians), nothing(), empty(),
+    None), m0(obj, "Name") (call a parameterless method: late binding often
+    returns e.g. doc.GetTitle as a value, so doc.GetTitle() fails), mm (0.001), deg (degrees -> radians), nothing(), empty(),
     out_int() (ByRef Long; read .value), select_at(doc, "FACE", [x,y,z]mm,
     append), win32com, pythoncom, math. Assign to `result` to return a value;
     print() output is returned too. The API uses metres and radians."""
     app = sw.app()
     env = {
         "swApp": app, "doc": app.ActiveDoc, "mm": MM, "deg": math.radians, "math": math,
-        "nothing": sw.nothing, "empty": sw.empty, "out_int": sw.out_int, "select_at": sw.select_at,
+        "m0": sw.m0, "nothing": sw.nothing, "empty": sw.empty, "out_int": sw.out_int, "select_at": sw.select_at,
         "result": None,
     }
     import pythoncom
