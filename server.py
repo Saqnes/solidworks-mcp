@@ -236,13 +236,16 @@ def list_dimensions(feature: str = "") -> list[dict]:
     if sw.m0(doc, "GetType") == DOC_DRAWING:
         return _drawing_dimensions(doc)
     feats = [sw.feature(doc, feature)] if feature else list(sw.iter_features(doc))
-    out = []
+    out, seen = [], set()
     for f in feats:
         dd = sw.m0(f, "GetFirstDisplayDimension")
         while dd is not None:
             dim = dd.GetDimension2(0)
             value, unit = _dim_value(dim)
-            out.append({"name": "@".join(dim.FullName.split("@")[:2]), "value": value, "unit": unit, "feature": f.Name})
+            name = "@".join(dim.FullName.split("@")[:2])
+            if name not in seen:  # an extrude also shows its sketch's dimensions
+                seen.add(name)
+                out.append({"name": name, "value": value, "unit": unit, "feature": name.split("@")[1]})
             dd = f.GetNextDisplayDimension(dd)
     return out
 
@@ -506,6 +509,31 @@ def _datum_lines(segments: list[Any]) -> tuple[Any, Any]:
     return (left[1] if left else None), (bottom[1] if bottom else None)
 
 
+def _rect_sides(segments: list[Any]) -> dict[str, Any]:
+    """left/right/bottom/top solid lines of a rectangle's segments."""
+    vert, horiz = [], []
+    for seg in segments:
+        try:
+            if sw.m0(seg, "GetType") != 0 or seg.ConstructionGeometry:
+                continue
+            a, b = sw.m0(seg, "GetStartPoint2"), sw.m0(seg, "GetEndPoint2")
+        except Exception:
+            continue
+        if abs(a.X - b.X) < 1e-9:
+            vert.append((a.X, seg))
+        elif abs(a.Y - b.Y) < 1e-9:
+            horiz.append((a.Y, seg))
+    if len(vert) < 2 or len(horiz) < 2:
+        return {}
+    vert.sort(key=lambda v: v[0])
+    horiz.sort(key=lambda h: h[0])
+    return {"left": vert[0][1], "right": vert[-1][1], "bottom": horiz[0][1], "top": horiz[-1][1]}
+
+
+def _close(a: float, b: float) -> bool:
+    return abs(a - b) < 1e-9
+
+
 INPUT_DIM_ON_CREATE = 10  # swUserPreferenceToggle_e.swInputDimValOnCreate
 
 
@@ -520,6 +548,65 @@ def _to_model(sk: Any, x: float, y: float) -> tuple[float, float, float]:
         return (x, y, 0.0)
 
 
+def _symmetry(doc: Any, sm: Any, rects: list, circles: list, select: Any, notes: list[str]) -> None:
+    """Keep geometry drawn symmetric about the sketch origin symmetric when
+    dimensions change: rectangles centred on the origin and holes in mirror
+    pairs get symmetric relations about fixed construction centerlines, so a
+    wider plate keeps its hole pattern centred."""
+    v_pairs, h_pairs, sym_rects = [], [], []
+    for spec, sides in rects:
+        if not sides:
+            continue
+        t = spec.get("type")
+        centred = (
+            t == "center_rectangle" and _close(spec.get("cx", 0), 0) and _close(spec.get("cy", 0), 0)
+        ) or (
+            t == "rectangle" and _close(spec["x1"], -spec["x2"]) and _close(spec["y1"], -spec["y2"])
+        )
+        if centred:
+            sym_rects.append(sides)
+    for a in circles:
+        if a[0] < 0:  # mirror partner across the vertical axis
+            b = next((c for c in circles if _close(c[0], -a[0]) and _close(c[1], a[1]) and _close(c[2], a[2])), None)
+            if b is not None:
+                v_pairs.append((a, b))
+            # across the horizontal axis, only on the left half: the right half
+            # follows from the vertical pairs, and more would over-define
+            if a[1] < 0:
+                c = next((c for c in circles if _close(c[0], a[0]) and _close(c[1], -a[1]) and _close(c[2], a[2])), None)
+                if c is not None:
+                    h_pairs.append((a, c))
+    if not (sym_rects or v_pairs or h_pairs):
+        return
+    # centerlines a little longer than the geometry they mirror
+    extent = [abs(c[0]) + c[2] for c in circles] + [abs(c[1]) + c[2] for c in circles]
+    for spec, _ in rects:
+        if spec.get("type") == "center_rectangle":
+            extent += [mm(spec["width"]) / 2, mm(spec["height"]) / 2]
+        else:
+            extent += [abs(mm(spec[k])) for k in ("x1", "y1", "x2", "y2")]
+    reach = 1.2 * max(extent, default=0.05) + 5 * MM
+    axes = {}
+    try:
+        for name, (x1, y1, x2, y2) in (("v", (0, -reach, 0, reach)), ("h", (-reach, 0, reach, 0))):
+            line = sm.CreateCenterLine(x1, y1, 0, x2, y2, 0)
+            if line is None or not select(line):
+                raise RuntimeError(f"could not create the {name} centerline")
+            doc.SketchAddConstraints("sgFIXED")
+            axes[name] = line
+        for sides in sym_rects:
+            for a, b, axis in (("left", "right", "v"), ("bottom", "top", "h")):
+                if select(sides[a], sides[b], axes[axis]):
+                    doc.SketchAddConstraints("sgSYMMETRIC")
+        for pairs, axis in ((v_pairs, "v"), (h_pairs, "h")):
+            for a, b in pairs:
+                if select(sw.m0(a[3], "GetCenterPoint2"), sw.m0(b[3], "GetCenterPoint2"), axes[axis]):
+                    doc.SketchAddConstraints("sgSYMMETRIC")
+    except Exception as exc:
+        notes.append(f"symmetry: {exc}")
+    doc.ClearSelection2(True)
+
+
 def _dimension_intent(doc: Any, sm: Any, entities: list[dict], created: list[Any]) -> tuple[int, list[str]]:
     """Add the dimensions a designer would: overall width/height of
     rectangles, one diameter per hole size (equal relations for the rest)
@@ -529,23 +616,26 @@ def _dimension_intent(doc: Any, sm: Any, entities: list[dict], created: list[Any
     off = 8 * MM  # how far dimension text sits from the geometry
     added, notes = 0, []
 
-    def place(kind: str, x: float, y: float) -> None:
+    def place(kind: str, x: float, y: float) -> Any:
         nonlocal added
         add = {"size": doc.AddDimension2, "h": doc.AddHorizontalDimension2, "v": doc.AddVerticalDimension2}[kind]
-        if add(*_to_model(sk, x, y)) is not None:
+        dd = add(*_to_model(sk, x, y))
+        if dd is not None:
             added += 1
         else:
             notes.append(f"{kind} dimension at ({x / MM:.1f}, {y / MM:.1f}) mm not added")
         doc.ClearSelection2(True)
+        return dd
 
     def select(*ents: Any) -> bool:
         doc.ClearSelection2(True)
         return all(sw._select_entity(doc, e, i > 0, 0) for i, e in enumerate(ents))
 
-    circles = []
+    circles, rects = [], []
     for spec, made in zip(entities, created):
         try:
             if spec.get("type") in ("rectangle", "center_rectangle") and made:
+                rects.append((spec, _rect_sides(_flatten([made]))))
                 left, bottom = _datum_lines(_flatten([made]))
                 if bottom is not None and select(bottom):
                     a, b = sw.m0(bottom, "GetStartPoint2"), sw.m0(bottom, "GetEndPoint2")
@@ -559,6 +649,8 @@ def _dimension_intent(doc: Any, sm: Any, entities: list[dict], created: list[Any
             notes.append(f"{spec.get('type')}: {exc}")
             doc.ClearSelection2(True)
 
+    _symmetry(doc, sm, rects, circles, select, notes)
+
     by_size: dict[float, list] = {}
     for c in circles:
         by_size.setdefault(round(c[2], 9), []).append(c)
@@ -566,7 +658,9 @@ def _dimension_intent(doc: Any, sm: Any, entities: list[dict], created: list[Any
         try:
             cx, cy, _, seg = group[0]
             if select(seg):
-                place("size", cx + 1.5 * r, cy + 1.5 * r)
+                dd = place("size", cx + 1.5 * r, cy + 1.5 * r)
+                if dd is not None and len(group) > 1:
+                    dd.SetText(1, f"{len(group)}X ")  # swDimensionTextPrefix -> "4X Ø6.6"
             if len(group) > 1 and select(*(g[3] for g in group)):
                 doc.SketchAddConstraints("sgSAMELENGTH")  # equal radius
                 doc.ClearSelection2(True)
