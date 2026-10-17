@@ -100,6 +100,23 @@ def m0(obj: Any, name: str) -> Any:
     return attr() if inspect.isroutine(attr) else attr
 
 
+def invoke(obj: Any, name: str, *args: Any) -> Any:
+    """Call an API method whose arguments are all optional. Late binding may
+    already have invoked it (with no arguments) and handed back its result,
+    e.g. IMeasure.Calculate arriving as a bool."""
+    attr = getattr(obj, name)
+    return attr(*args) if inspect.isroutine(attr) else attr
+
+
+def put_indexed(obj: Any, name: str, index: Any, value: Any) -> None:
+    """Assign an indexed property (VBA: obj.Name(index) = value), which
+    pywin32's late binding has no syntax for."""
+    import pythoncom
+
+    dispid = obj._oleobj_.GetIDsOfNames(name)
+    obj._oleobj_.Invoke(dispid, 0, pythoncom.DISPATCH_PROPERTYPUT, False, index, value)
+
+
 # --- Connection -----------------------------------------------------------
 
 _app: Any = None

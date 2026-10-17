@@ -319,17 +319,30 @@ def screenshot(view: Literal["current", "front", "back", "left", "right", "top",
 
 
 @tool
-def set_dimension(name: str, value: float) -> dict:
+def set_dimension(name: str, value: float, configurations: Literal["this", "all"] = "this") -> dict:
     """Change a dimension (mm, or degrees for angles) and rebuild.
-    `name` is as returned by list_dimensions, e.g. "D1@Sketch1"."""
+    `name` is as returned by list_dimensions, e.g. "D1@Sketch1". By default
+    only the active configuration changes; configurations="all" changes
+    every configuration. A dimension driven by an equation must be changed
+    through set_equation instead."""
     doc = sw.active_doc()
     dim = doc.Parameter(name)
     if dim is None:
         raise LookupError(f"No dimension {name!r}; use list_dimensions")
-    dim.SystemValue = deg(value) if sw.m0(dim, "GetType") == 2 else mm(value)
+    system = deg(value) if sw.m0(dim, "GetType") == 2 else mm(value)
+    which = 1 if configurations == "this" else 2  # swSetValue_InThisConfiguration / _InAllConfigurations
+    status = _call_first(dim, [
+        ("SetSystemValue3", (system, which, sw.nothing())),
+        ("SetSystemValue2", (system, which)),
+    ])
+    if status not in (0, None):  # swSetValue_Successful = 0
+        raise RuntimeError(f"SOLIDWORKS refused the value (swSetValueReturnStatus {status}); is it driven by an equation?")
     _rebuild(doc)
     new, unit = _dim_value(dim)
-    return {"name": name, "value": new, "unit": unit}
+    return {
+        "name": name, "value": new, "unit": unit,
+        "configuration": doc.ConfigurationManager.ActiveConfiguration.Name if configurations == "this" else "all",
+    }
 
 
 @tool
@@ -374,16 +387,17 @@ def delete_feature(name: str, keep_sketches: bool = False) -> dict:
 
 
 @tool
-def suppress_feature(name: str, suppress: bool = True) -> str:
-    """Suppress or unsuppress a feature."""
+def suppress_feature(name: str, suppress: bool = True, configurations: Literal["this", "all"] = "this") -> str:
+    """Suppress or unsuppress a feature, in the active configuration only
+    (default) or in all configurations."""
     doc = sw.active_doc()
-    doc.ClearSelection2(True)
-    sw.select_feature(doc, name)
-    ok = sw.m0(doc, "EditSuppress2") if suppress else sw.m0(doc, "EditUnsuppress2")
+    feat = sw.feature(doc, name)
+    # swSuppressFeature / swUnSuppressFeature; swThisConfiguration / swAllConfiguration
+    ok = _call_first(feat, [("SetSuppression2", (0 if suppress else 1, 1 if configurations == "this" else 2, sw.nothing()))])
     if not ok:
         raise RuntimeError(f"Could not change suppression of {name!r}")
     _rebuild(doc)
-    return f"{'suppressed' if suppress else 'unsuppressed'} {name}"
+    return f"{'suppressed' if suppress else 'unsuppressed'} {name} ({configurations} configuration{'s' if configurations == 'all' else ''})"
 
 
 def _material_library() -> list[dict]:
@@ -576,7 +590,9 @@ def _symmetry(doc: Any, sm: Any, rects: list, circles: list, select: Any, notes:
                 c = next((c for c in circles if _close(c[0], a[0]) and _close(c[1], -a[1]) and _close(c[2], a[2])), None)
                 if c is not None:
                     h_pairs.append((a, c))
-    if not (sym_rects or v_pairs or h_pairs):
+    on_v = [c for c in circles if _close(c[0], 0)]  # centred left-right
+    on_h = [c for c in circles if _close(c[1], 0)]  # centred top-bottom
+    if not (sym_rects or v_pairs or h_pairs or on_v or on_h):
         return
     # centerlines a little longer than the geometry they mirror
     extent = [abs(c[0]) + c[2] for c in circles] + [abs(c[1]) + c[2] for c in circles]
@@ -602,6 +618,10 @@ def _symmetry(doc: Any, sm: Any, rects: list, circles: list, select: Any, notes:
             for a, b in pairs:
                 if select(sw.m0(a[3], "GetCenterPoint2"), sw.m0(b[3], "GetCenterPoint2"), axes[axis]):
                     doc.SketchAddConstraints("sgSYMMETRIC")
+        for group, axis in ((on_v, "v"), (on_h, "h")):
+            for c in group:
+                if select(sw.m0(c[3], "GetCenterPoint2"), axes[axis]):
+                    doc.SketchAddConstraints("sgCOINCIDENT")
     except Exception as exc:
         notes.append(f"symmetry: {exc}")
     doc.ClearSelection2(True)
@@ -1205,6 +1225,26 @@ def list_equations() -> list[dict]:
     return _equations(sw.m0(sw.active_doc(), "GetEquationMgr"))
 
 
+def _replace_equation(eqm: Any, index: int, old: str, text: str) -> None:
+    """Edit equation `index` in place (so dimensions referencing a global
+    variable stay linked); if SOLIDWORKS refuses, leave the old one intact."""
+    try:
+        sw.put_indexed(eqm, "Equation", index, text)
+        if eqm.Equation(index).replace(" ", "") == text.replace(" ", ""):
+            return
+    except Exception:
+        pass
+    try:  # the same edit through the configuration-aware setter
+        _call_first(eqm, [("SetEquationAndConfigurationOption", (index, text, 0, sw.nothing()))])
+        if eqm.Equation(index).replace(" ", "") == text.replace(" ", ""):
+            return
+    except Exception:
+        pass
+    if eqm.Equation(index).replace(" ", "") != old.replace(" ", ""):
+        sw.put_indexed(eqm, "Equation", index, old)
+    raise RuntimeError(f"SOLIDWORKS rejected {text!r}; kept {old!r}")
+
+
 @tool
 def set_equation(lhs: str, rhs: str) -> list[dict]:
     """Add or replace an equation. Global variable: lhs="Width", rhs="120".
@@ -1217,13 +1257,15 @@ def set_equation(lhs: str, rhs: str) -> list[dict]:
     text = f"{left} = {rhs}"
     for e in _equations(eqm):
         if e["equation"].split("=", 1)[0].strip().lower() == left.lower():
-            eqm.Delete(e["index"])
-            if eqm.Add2(e["index"], text, True) < 0:
-                raise RuntimeError(f"SOLIDWORKS rejected {text!r}")
+            _replace_equation(eqm, e["index"], e["equation"], text)
             break
     else:
         if eqm.Add2(-1, text, True) < 0:
             raise RuntimeError(f"SOLIDWORKS rejected {text!r}")
+    try:
+        sw.invoke(eqm, "EvaluateAll")
+    except Exception:
+        pass  # the rebuild below evaluates them too
     _rebuild(doc)
     return _equations(eqm)
 
@@ -1245,8 +1287,8 @@ def delete_equation(lhs: str) -> list[dict]:
 @tool
 def configurations(add: str = "", activate: str = "") -> dict:
     """List configurations; optionally add one (it becomes active) or
-    activate an existing one. Suppression and dimension changes made while a
-    configuration is active apply to that configuration."""
+    activate an existing one. While a configuration is active, set_dimension
+    and suppress_feature change only that configuration."""
     doc = sw.active_doc()
     if add:
         if doc.AddConfiguration3(add, "", "", 0) is None:
@@ -1278,7 +1320,7 @@ def measure(
     if point2:
         sw.select_at(doc, entity2, point2, True)
     m = sw.m0(doc.Extension, "CreateMeasure")
-    if not m.Calculate(sw.nothing()):
+    if not sw.invoke(m, "Calculate", sw.nothing()):  # Nothing = use the selection
         raise RuntimeError("SOLIDWORKS could not measure this selection")
     out = {}
     for key, attr, scale in (
