@@ -431,17 +431,67 @@ def _fully_define(sm: Any) -> str:
     """Let SOLIDWORKS add the dimensions/relations that fully define the
     open sketch (so they show up in drawings). Returns the resulting state."""
     sk = sm.ActiveSketch
-    try:
-        # relations, dimensions, all relation types, baseline scheme from the
-        # sketch origin (Nothing) horizontally and vertically, default placement
-        sm.FullyDefineSketch(True, True, 1023, 1, sw.nothing(), 1, sw.nothing(), 1, 1)
-    except Exception as exc:
-        return f"not dimensioned ({exc})"
-    states = {1: "under_defined", 2: "under_defined", 3: "fully_defined", 4: "over_defined"}
+    # FullyDefineSketch(Relations, Dimensions, RelationsToAdd, VerticalAndHorizontal,
+    #   HorizontalScheme, HorizontalDatum, VerticalScheme, VerticalDatum,
+    #   HorizontalPlacement, VerticalPlacement); datum Nothing = sketch origin.
+    # Enum values are tried from baseline/below/left down to all-zero defaults.
+    error = None
+    for scheme, hplace, vplace in ((1, 1, 1), (0, 0, 0)):
+        try:
+            sm.FullyDefineSketch(True, True, 1023, True, scheme, sw.nothing(), scheme, sw.nothing(), hplace, vplace)
+            error = None
+            break
+        except Exception as exc:
+            error = exc
+    if error is not None:
+        return f"not dimensioned ({error})"
+    states = {1: "unknown", 2: "under_defined", 3: "fully_defined", 4: "over_defined"}
     try:
         return states.get(sw.m0(sk, "GetConstrainedStatus"), "unknown")
     except Exception:
         return "unknown"
+
+
+def _sketch_normal_axis(feat: Any) -> int | None:
+    """Model axis (0=x, 1=y, 2=z) a finished sketch faces, or None if tilted."""
+    try:
+        data = sw.m0(sw.m0(sw.m0(feat, "GetSpecificFeature2"), "ModelToSketchTransform"), "ArrayData")
+    except Exception:
+        return None
+    normal = data[6:9]
+    axis = max(range(3), key=lambda i: abs(normal[i]))
+    return axis if abs(abs(normal[axis]) - 1) < 1e-6 else None
+
+
+def _select_plane(doc: Any, target: Any) -> None:
+    # Name-based selection is what a recorded macro does; Feature.Select2
+    # was seen to be ignored by InsertSketch on a freshly created part.
+    if doc.Extension.SelectByID2(target.Name, "PLANE", 0, 0, 0, False, 0, sw.nothing(), 0):
+        return
+    if not target.Select2(False, 0):
+        raise RuntimeError(f"Could not select plane {target.Name!r}")
+
+
+def _draw(doc: Any, entities: list[dict], dimension: bool) -> tuple[Any, list[int], str | None]:
+    """Open a sketch on the current selection, draw, optionally dimension, close."""
+    sm = doc.SketchManager
+    sm.InsertSketch(True)
+    if sm.ActiveSketch is None:
+        raise RuntimeError("SOLIDWORKS did not open a sketch on the selected plane/face")
+    sm.AddToDB = True  # no snapping/inference to nearby geometry
+    failed: list[int] = []
+    state = None
+    try:
+        for i, e in enumerate(entities):
+            if _sketch_entity(sm, e) is None:
+                failed.append(i)
+        sm.AddToDB = False
+        if dimension and len(failed) < len(entities):
+            state = _fully_define(sm)
+    finally:
+        sm.AddToDB = False
+        sm.InsertSketch(True)
+    return sw.last_feature_of_type(doc, "ProfileFeature"), failed, state
 
 
 @tool
@@ -456,34 +506,43 @@ def sketch(entities: list[dict], plane: str = "front", face_point: list[float] |
       {"type":"slot","x1","y1","x2","y2","width"}  {"type":"point","x","y"}
     Profiles for extrude must be closed; a revolve profile needs one centerline as its axis.
     dimension=true (default) lets SOLIDWORKS add the dimensions that fully
-    define the sketch, so they can be changed later and appear in drawings."""
+    define the sketch, so they can be changed later and appear in drawings.
+    The result's "normal" is the model axis the sketch actually faces."""
     doc = sw.active_doc(DOC_PART)
-    doc.ClearSelection2(True)
-    if face_point:
-        sw.select_at(doc, "FACE", face_point, False)
-    else:
+    target, expected = None, None
+    if not face_point:
         key = plane.lower()
-        target = sw.standard_plane(doc, key) if key in sw.PLANE_NAMES else sw.feature(doc, plane)
-        if not target.Select2(False, 0):
-            raise RuntimeError(f"Could not select plane {plane!r}")
-    sm = doc.SketchManager
-    sm.InsertSketch(True)
-    sm.AddToDB = True  # no snapping/inference to nearby geometry
-    failed = []
-    state = None
-    try:
-        for i, e in enumerate(entities):
-            if _sketch_entity(sm, e) is None:
-                failed.append(i)
-        sm.AddToDB = False
-        if dimension and len(failed) < len(entities):
-            state = _fully_define(sm)
-    finally:
-        sm.AddToDB = False
-        sm.InsertSketch(True)
-    feat = sw.last_feature_of_type(doc, "ProfileFeature")
-    on = f"face at {face_point} mm" if face_point else target.Name
-    result = {"sketch": feat.Name, "on": on, "entities": len(entities) - len(failed)}
+        if key in sw.PLANE_NAMES:
+            target, expected = sw.standard_plane(doc, key), sw.PLANE_AXIS[key]
+        else:
+            target = sw.feature(doc, plane)
+            expected = sw._plane_normal_axis(target)
+    for attempt in range(2):
+        doc.ClearSelection2(True)
+        if face_point:
+            sw.select_at(doc, "FACE", face_point, False)
+        else:
+            _select_plane(doc, target)
+        feat, failed, state = _draw(doc, entities, dimension)
+        actual = _sketch_normal_axis(feat)
+        if expected is None or actual is None or actual == expected:
+            break
+        # Landed on the wrong plane: remove it and try once more.
+        bad = feat.Name
+        doc.ClearSelection2(True)
+        sw.select_feature(doc, bad)
+        doc.Extension.DeleteSelection2(0)
+        if attempt == 1:
+            raise RuntimeError(
+                f"Sketch kept landing on the plane facing {'xyz'[actual]} instead of "
+                f"{'xyz'[expected]} ({target.Name}); deleted {bad}"
+            )
+    result = {
+        "sketch": feat.Name,
+        "on": f"face at {face_point} mm" if face_point else target.Name,
+        "normal": "xyz"[actual] if actual is not None else "unknown",
+        "entities": len(entities) - len(failed),
+    }
     if state:
         result["definition"] = state
     if failed:
