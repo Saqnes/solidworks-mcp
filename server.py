@@ -490,6 +490,17 @@ def _sketch_entity(sm: Any, e: dict) -> Any:
         return sm.CreateSketchSlot(0, 0, g("width"), g("x1"), g("y1"), 0, g("x2"), g("y2"), 0, 0, 0, 0, 1, False)
     if t == "point":
         return sm.CreatePoint(g("x"), g("y"), 0)
+    if t == "ellipse":
+        cx, cy = g("cx", 0.0), g("cy", 0.0)
+        a, b, ang = g("major_radius"), g("minor_radius"), math.radians(float(e.get("angle", 0)))
+        return sm.CreateEllipse(cx, cy, 0, cx + a * math.cos(ang), cy + a * math.sin(ang), 0,
+                                cx - b * math.sin(ang), cy + b * math.cos(ang), 0)
+    if t == "spline":
+        pts = [c for x, y in e["points"] for c in (mm(x), mm(y), 0.0)]
+        return sm.CreateSpline2(sw.doubles(pts), True)
+    if t == "text":
+        # x, y = lower-left corner; height follows the document's default font
+        return sm.InsertSketchText(g("x", 0.0), g("y", 0.0), 0, str(e["text"]), 0, 0, 0, 100, 100)
     raise ValueError(f"Unknown sketch entity type {t!r}")
 
 
@@ -810,6 +821,8 @@ def sketch(entities: list[dict], plane: str = "front", face_point: list[float] |
       {"type":"circle","cx","cy","r"}  {"type":"polygon","cx","cy","r","sides"} (inscribed)
       {"type":"arc","cx","cy","x1","y1","x2","y2","clockwise":false}
       {"type":"slot","x1","y1","x2","y2","width"}  {"type":"point","x","y"}
+      {"type":"ellipse","cx","cy","major_radius","minor_radius","angle":0}
+      {"type":"spline","points":[[x,y],...]}  {"type":"text","x","y","text"} (cut it to engrave)
     Profiles for extrude must be closed; a revolve profile needs one centerline as its axis.
     dimension=true (default) adds design-intent dimensions (overall
     rectangle width/height, one diameter per hole size with equal relations,
@@ -1451,6 +1464,253 @@ def export_folder(folder: str, extension: str = "step", recursive: bool = False,
     if previous is not None:
         app.ActivateDoc3(sw.m0(previous, "GetTitle"), False, 0, sw.out_int())
     return results
+
+
+# --- Holes (ISO metric) -------------------------------------------------------
+
+# ISO 273 medium clearance, ISO coarse tap drills, ISO 4762 counterbores
+# (diameter, depth) and 90° countersinks for ISO 10642, in mm.
+CLEARANCE = {"M2": 2.4, "M2.5": 2.9, "M3": 3.4, "M4": 4.5, "M5": 5.5, "M6": 6.6, "M8": 9.0,
+             "M10": 11.0, "M12": 13.5, "M16": 17.5, "M20": 22.0}
+TAP_DRILL = {"M2": 1.6, "M2.5": 2.05, "M3": 2.5, "M4": 3.3, "M5": 4.2, "M6": 5.0, "M8": 6.8,
+             "M10": 8.5, "M12": 10.2, "M16": 14.0, "M20": 17.5}
+COUNTERBORE = {"M2": (4.4, 2.3), "M2.5": (5.5, 2.8), "M3": (6.5, 3.3), "M4": (8.0, 4.4),
+               "M5": (10.0, 5.4), "M6": (11.0, 6.4), "M8": (15.0, 8.6), "M10": (18.0, 10.6),
+               "M12": (20.0, 12.6), "M16": (26.0, 16.6), "M20": (33.0, 20.6)}
+COUNTERSINK = {"M2": 4.4, "M2.5": 5.5, "M3": 6.72, "M4": 8.96, "M5": 11.2, "M6": 13.44, "M8": 17.92,
+               "M10": 22.4, "M12": 26.88, "M16": 33.6, "M20": 40.32}
+HOLE_NAMES = {"clearance": "관통 구멍", "tapped": "탭 구멍", "counterbore": "카운터보어", "countersink": "카운터싱크"}
+
+
+def _circles(positions: list[list[float]], diameter: float) -> list[dict]:
+    return [{"type": "circle", "cx": x, "cy": y, "r": diameter / 2} for x, y in positions]
+
+
+def _rename(feat_name: str, new: str) -> str:
+    try:
+        sw.feature(sw.active_doc(), feat_name).Name = new
+        return new
+    except Exception:
+        return feat_name  # name taken or not allowed: keep SOLIDWORKS' name
+
+
+@tool
+def hole(
+    size: str,
+    positions: list[list[float]],
+    kind: Literal["clearance", "tapped", "counterbore", "countersink"] = "clearance",
+    face_point: list[float] | None = None,
+    plane: str = "top",
+    depth: float = 0.0,
+) -> dict:
+    """ISO metric holes (M2-M20) at several positions at once. Place them on
+    the face at face_point ([x,y,z] mm, e.g. the top face) or on a plane;
+    positions are 2D sketch coordinates like sketch(). depth 0 = through
+    all. kind: clearance (ISO 273 medium), tapped (tap drill; the thread size
+    goes in the feature name), counterbore (socket head ISO 4762) or
+    countersink (90°, ISO 10642). Sizes come from built-in tables, so check
+    them against your drawing standard."""
+    size = size.upper().replace(" ", "")
+    if size not in CLEARANCE:
+        raise ValueError(f"Unknown size {size!r}; supported: {sorted(CLEARANCE, key=lambda k: float(k[1:]))}")
+    where = {"face_point": face_point} if face_point else {"plane": plane}
+    sketch_fn, extrude_fn = sketch.__wrapped__, extrude.__wrapped__
+    made = []
+    if kind == "counterbore":
+        cb_d, cb_h = COUNTERBORE[size]
+        sk = sketch_fn(_circles(positions, cb_d), **where)["sketch"]
+        made.append(_rename(extrude_fn(depth=cb_h, sketch_name=sk, cut=True)["feature"], f"{size} 카운터보어 자리"))
+    elif kind == "countersink":
+        d = CLEARANCE[size]
+        cs_d = COUNTERSINK[size]
+        sk = sketch_fn(_circles(positions, cs_d), **where)["sketch"]
+        # a 45° inward draft from the countersink diameter down to the hole
+        made.append(_rename(extrude_fn(depth=round((cs_d - d) / 2, 4), sketch_name=sk, cut=True, draft_angle=45)["feature"], f"{size} 카운터싱크 자리"))
+    d = TAP_DRILL[size] if kind == "tapped" else CLEARANCE[size]
+    sk = sketch_fn(_circles(positions, d), **where)["sketch"]
+    end = "blind" if depth > 0 else "through_all"
+    hole_feat = extrude_fn(depth=depth or 10.0, sketch_name=sk, cut=True, end=end)["feature"]
+    made.append(_rename(hole_feat, f"{size} {HOLE_NAMES[kind]}"))
+    info = {"features": made, "count": len(positions), "drill_mm": d}
+    if kind == "counterbore":
+        info["counterbore_mm"] = {"diameter": COUNTERBORE[size][0], "depth": COUNTERBORE[size][1]}
+    if kind == "countersink":
+        info["countersink_mm"] = COUNTERSINK[size]
+    return info
+
+
+# --- Sweeps, lofts, ribs and 3D sketches -------------------------------------
+
+
+@tool
+def sketch3d(entities: list[dict]) -> dict:
+    """3D sketch in model coordinates (mm), e.g. a sweep path. Entities:
+      {"type":"polyline","points":[[x,y,z],...]}  (connected lines)
+      {"type":"line","p1":[x,y,z],"p2":[x,y,z]}
+      {"type":"spline","points":[[x,y,z],...]}"""
+    doc = sw.active_doc(DOC_PART)
+    doc.ClearSelection2(True)
+    sm = doc.SketchManager
+    sm.Insert3DSketch(True)
+    sm.AddToDB = True
+    failed = []
+    try:
+        for i, e in enumerate(entities):
+            t = e.get("type")
+            if t == "line":
+                ok = sm.CreateLine(*(mm(v) for v in e["p1"]), *(mm(v) for v in e["p2"])) is not None
+            elif t == "polyline":
+                pts = e["points"]
+                ok = all(sm.CreateLine(*(mm(v) for v in a), *(mm(v) for v in b)) is not None for a, b in zip(pts, pts[1:]))
+            elif t == "spline":
+                ok = sm.CreateSpline2(sw.doubles([mm(v) for p in e["points"] for v in p]), True) is not None
+            else:
+                raise ValueError(f"Unknown 3D sketch entity type {t!r}")
+            if not ok:
+                failed.append(i)
+    finally:
+        sm.AddToDB = False
+        sm.Insert3DSketch(True)
+    feat = sw.last_feature_of_type(doc, "3DProfileFeature")
+    result = {"sketch": feat.Name, "entities": len(entities) - len(failed)}
+    if failed:
+        result["failed_entities"] = failed
+    return result
+
+
+def _last_sketch_name(doc: Any) -> str:
+    for i in range(200):
+        f = doc.FeatureByPositionReverse(i)
+        if f is None:
+            break
+        if sw.m0(f, "GetTypeName2") in ("ProfileFeature", "3DProfileFeature"):
+            return f.Name
+    raise LookupError("No sketch found")
+
+
+@tool
+def sweep(
+    path: str,
+    profile: str = "",
+    circle_diameter: float = 0.0,
+    wall: float = 0.0,
+    cut: bool = False,
+) -> dict:
+    """Sweep a closed profile sketch along a path sketch (2D or 3D, by name).
+    Without a profile, sweep a circle of circle_diameter mm along the path
+    (pipes, wires, grooves). wall > 0 makes it a hollow tube of that wall
+    thickness. cut=true removes material instead."""
+    doc = sw.active_doc(DOC_PART)
+    doc.ClearSelection2(True)
+    circular = not profile
+    if circular and circle_diameter <= 0:
+        raise ValueError("Give a profile sketch or a circle_diameter")
+    if profile:
+        sw.select_feature(doc, profile, mark=1)
+    sw.select_feature(doc, path, append=True, mark=4)
+    thin, t1 = wall > 0, mm(wall)
+    dia = mm(circle_diameter)
+    fm = doc.FeatureManager
+    # Propagate, Alignment, TwistCtrlType, KeepTangency, AdvancedSmoothing, StartMatching,
+    # EndMatching, IsThin, Thickness1, Thickness2, ThinType, PathAlign, ...
+    head = (False, False, 0, False, False, 0, 0, thin, t1, t1, 0, 0)
+    if cut:
+        tail = (True, True, 0, True)  # UseFeatScope, UseAutoSelect, TwistAngle, MergeSmoothFaces
+        feat = _call_first(fm, [
+            ("InsertCutSwept5", head + tail + (False, False, False, circular, dia, 0)),
+            ("InsertCutSwept4", head + tail + (False, False, False)),
+        ])
+    else:
+        tail = (True, True, True, 0, True)  # Merge, UseFeatScope, UseAutoSelect, TwistAngle, MergeSmoothFaces
+        feat = _call_first(fm, [
+            ("InsertProtrusionSwept4", head + tail + (circular, dia, 0)),
+            ("InsertProtrusionSwept3", head + tail),
+        ])
+    return _feature_result(feat, "sweep cut" if cut else "sweep")
+
+
+@tool
+def loft(profiles: list[str], guides: list[str] | None = None, cut: bool = False, closed: bool = False) -> dict:
+    """Loft through profile sketches (names, in order, on different planes,
+    e.g. made with offset_plane), optionally steered by guide curve sketches.
+    cut=true removes material."""
+    if len(profiles) < 2:
+        raise ValueError("A loft needs at least two profiles")
+    doc = sw.active_doc(DOC_PART)
+    doc.ClearSelection2(True)
+    _select_features(doc, profiles, 1, append=False)
+    for g in guides or []:
+        sw.select_feature(doc, g, append=True, mark=2)
+    fm = doc.FeatureManager
+    if cut:
+        base = (closed, True, False, 1, 0, 0, False, 0, 0, 0, True, True)
+        feat = _call_first(fm, [("InsertCutBlend", base + (0,)), ("InsertCutBlend", base)])
+    else:
+        base = (closed, True, False, 1, 0, 0, 1, 1, True, True, False, 0, 0, 0, True, True, True)
+        feat = _call_first(fm, [("InsertProtrusionBlend2", base + (0,)), ("InsertProtrusionBlend", base)])
+    return _feature_result(feat, "loft cut" if cut else "loft")
+
+
+@tool
+def rib(thickness: float, sketch_name: str = "", both_sides: bool = True, flip_material: bool = False) -> dict:
+    """Rib from an open sketch (e.g. one line between two walls), default
+    the most recent sketch; thickness in mm."""
+    doc = sw.active_doc(DOC_PART)
+    doc.ClearSelection2(True)
+    sw.select_feature(doc, sketch_name or _last_sketch_name(doc))
+    feat = _call_first(doc.FeatureManager, [
+        ("InsertRib", (both_sides, False, mm(thickness), 0, flip_material, False, True, 0, False)),
+    ])
+    return _feature_result(feat, "rib")
+
+
+# --- Sheet metal --------------------------------------------------------------
+
+
+@tool
+def sheet_metal_base_flange(thickness: float, bend_radius: float, length: float = 0.0, sketch_name: str = "", reverse: bool = False) -> dict:
+    """Start a sheet metal part from a sketch (default the most recent):
+    a closed sketch becomes a flat plate; an open profile (e.g. an L or U
+    of lines) is extruded `length` mm with bends of bend_radius. Experimental:
+    report the error text if it fails."""
+    doc = sw.active_doc(DOC_PART)
+    doc.ClearSelection2(True)
+    sw.select_feature(doc, sketch_name or _last_sketch_name(doc))
+    t, r, l = mm(thickness), mm(bend_radius), mm(length or 10)
+    feat = _call_first(doc.FeatureManager, [
+        ("InsertSheetMetalBaseFlange2", (t, False, r, l, l, reverse, 0, 0, 0, sw.nothing(), False, 0.5, 0.0001, 0.0001, 0.5, True, False, True, True)),
+        ("InsertSheetMetalBaseFlange2", (t, False, r, l, l, reverse, 0, 0, 0, sw.nothing(), False, 0.5, 0.0001, 0.0001, 0.5, True, False, True)),
+    ])
+    return _feature_result(feat, "base flange")
+
+
+@tool
+def flatten(flat: bool = True) -> str:
+    """Show a sheet metal part flat (true) or folded (false)."""
+    doc = sw.active_doc(DOC_PART)
+    flat_pattern = next((f for f in sw.iter_features(doc) if sw.m0(f, "GetTypeName2") == "FlatPattern"), None)
+    if flat_pattern is None:
+        raise LookupError("No flat pattern: this is not a sheet metal part")
+    if not _call_first(flat_pattern, [("SetSuppression2", (1 if flat else 0, 2, sw.nothing()))]):
+        raise RuntimeError("Could not change the flat pattern state")
+    _rebuild(doc)
+    return "flattened" if flat else "folded"
+
+
+@tool
+def export_flat_pattern(path: str, bend_lines: bool = True) -> dict:
+    """Export the flat pattern of the active (saved) sheet metal part to
+    DXF/DWG for laser cutting, with bend lines by default."""
+    doc = sw.active_doc(DOC_PART)
+    model = sw.m0(doc, "GetPathName")
+    if not model:
+        raise RuntimeError("Save the part first; the export reads the saved model")
+    target = str(Path(path))
+    options = 1 | (4 if bend_lines else 0)  # geometry, bend lines
+    ok = doc.ExportToDWG2(target, model, 1, True, sw.nothing(), False, False, options, sw.nothing())  # 1 = sheet metal
+    if not ok or not os.path.exists(target):
+        raise RuntimeError(f"Flat pattern export failed for {target}")
+    return {"path": target, "bytes": os.path.getsize(target)}
 
 
 # --- Escape hatches -------------------------------------------------------
