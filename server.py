@@ -15,6 +15,7 @@ import math
 import os
 import tempfile
 import traceback
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Literal
 
@@ -294,14 +295,30 @@ def undo(steps: int = 1) -> str:
 
 
 @tool
-def delete_feature(name: str) -> str:
-    """Delete a feature together with its absorbed sketch."""
+def delete_feature(name: str, keep_sketches: bool = False) -> dict:
+    """Delete a feature. Sketches it absorbed (used only by this feature) are
+    deleted with it unless keep_sketches=true."""
     doc = sw.active_doc()
+    feat = sw.feature(doc, name)
+    absorbed = []
+    if not keep_sketches:
+        for parent in sw.m0(feat, "GetParents") or ():
+            if sw.m0(parent, "GetTypeName2") == "ProfileFeature" and len(sw.m0(parent, "GetChildren") or ()) <= 1:
+                absorbed.append(parent.Name)
     doc.ClearSelection2(True)
     sw.select_feature(doc, name)
     if not doc.Extension.DeleteSelection2(1):  # swDelete_Absorbed
         raise RuntimeError(f"Could not delete {name!r} (other features may depend on it)")
-    return f"deleted {name}"
+    deleted = [name]
+    for sk in absorbed:
+        if doc.FeatureByName(sk) is not None:  # not taken along by the delete above
+            doc.ClearSelection2(True)
+            sw.select_feature(doc, sk)
+            doc.Extension.DeleteSelection2(0)
+        if doc.FeatureByName(sk) is None:
+            deleted.append(sk)
+    _rebuild(doc)
+    return {"deleted": deleted}
 
 
 @tool
@@ -317,17 +334,58 @@ def suppress_feature(name: str, suppress: bool = True) -> str:
     return f"{'suppressed' if suppress else 'unsuppressed'} {name}"
 
 
+def _material_library() -> list[dict]:
+    """Every material in the material databases SOLIDWORKS is configured with."""
+    out = []
+    try:
+        paths = sw.m0(sw.app(), "GetMaterialDatabases") or ()
+    except Exception:
+        return out  # set_material then just tries the name as given
+    for path in paths:
+        try:
+            root = ET.parse(path).getroot()
+        except (OSError, ET.ParseError):
+            continue
+        for cls in root.iter():
+            if cls.tag.rsplit("}", 1)[-1] != "classification":
+                continue
+            for m in cls:
+                if m.tag.rsplit("}", 1)[-1] == "material" and m.get("name"):
+                    out.append({"name": m.get("name"), "category": cls.get("name"), "database": Path(path).stem})
+    return out
+
+
+def _norm(text: str) -> str:
+    return "".join(c for c in text.lower() if c.isalnum())
+
+
 @tool
-def set_material(material: str, database: str = "SOLIDWORKS Materials") -> dict:
-    """Assign a material to the active part, e.g. "AISI 304", "6061-T6 (SS)",
-    "ABS". Names must match the material library exactly."""
+def list_materials(query: str = "") -> list[dict]:
+    """Search the material library by name or category (e.g. "6061", "stainless",
+    "ABS"); returns the exact names set_material accepts."""
+    q = _norm(query)
+    return [m for m in _material_library() if q in _norm(m["name"]) or q in _norm(m["category"] or "")][:60]
+
+
+@tool
+def set_material(material: str, database: str = "") -> dict:
+    """Assign a material to the active part by its library name, e.g.
+    "AISI 304", "6061-T6 (SS)", "ABS". Unknown names fail with suggestions;
+    use list_materials to search."""
     doc = sw.active_doc(DOC_PART)
-    doc.SetMaterialPropertyName2("", database, material)
-    db = sw.out_bstr()
-    applied = doc.GetMaterialPropertyName2("", db)
+    library = _material_library()
+    exact = [m for m in library if m["name"].lower() == material.lower() and (not database or m["database"].lower() == database.lower())]
+    if exact:
+        material, database = exact[0]["name"], exact[0]["database"]
+    elif library:
+        q = _norm(material)
+        close = [m["name"] for m in library if q and (q in _norm(m["name"]) or _norm(m["name"]) in q)]
+        raise LookupError(f"Material {material!r} is not in the library. Closest names: {close[:15] or 'none'}; see list_materials")
+    doc.SetMaterialPropertyName2("", database or "SOLIDWORKS Materials", material)
+    applied = doc.GetMaterialPropertyName2("", sw.out_bstr())
     if applied != material:
-        raise LookupError(f"Material {material!r} not found in {database!r}")
-    return {"material": applied, "density_kg_m3": round(sw.m0(doc.Extension, "CreateMassProperty").Density, 3)}
+        raise LookupError(f"SOLIDWORKS did not accept material {material!r} from {database!r}")
+    return {"material": applied, "database": database, "density_kg_m3": round(sw.m0(doc.Extension, "CreateMassProperty").Density, 3)}
 
 
 @tool
@@ -369,8 +427,25 @@ def _sketch_entity(sm: Any, e: dict) -> Any:
     raise ValueError(f"Unknown sketch entity type {t!r}")
 
 
+def _fully_define(sm: Any) -> str:
+    """Let SOLIDWORKS add the dimensions/relations that fully define the
+    open sketch (so they show up in drawings). Returns the resulting state."""
+    sk = sm.ActiveSketch
+    try:
+        # relations, dimensions, all relation types, baseline scheme from the
+        # sketch origin (Nothing) horizontally and vertically, default placement
+        sm.FullyDefineSketch(True, True, 1023, 1, sw.nothing(), 1, sw.nothing(), 1, 1)
+    except Exception as exc:
+        return f"not dimensioned ({exc})"
+    states = {1: "under_defined", 2: "under_defined", 3: "fully_defined", 4: "over_defined"}
+    try:
+        return states.get(sw.m0(sk, "GetConstrainedStatus"), "unknown")
+    except Exception:
+        return "unknown"
+
+
 @tool
-def sketch(entities: list[dict], plane: str = "front", face_point: list[float] | None = None) -> dict:
+def sketch(entities: list[dict], plane: str = "front", face_point: list[float] | None = None, dimension: bool = True) -> dict:
     """Create a sketch and close it. Place it on "front"/"top"/"right", on any
     plane feature by name, or on the face at face_point ([x,y,z] mm).
     Coordinates are 2D sketch coordinates in mm. Entity types:
@@ -379,29 +454,38 @@ def sketch(entities: list[dict], plane: str = "front", face_point: list[float] |
       {"type":"circle","cx","cy","r"}  {"type":"polygon","cx","cy","r","sides"} (inscribed)
       {"type":"arc","cx","cy","x1","y1","x2","y2","clockwise":false}
       {"type":"slot","x1","y1","x2","y2","width"}  {"type":"point","x","y"}
-    Profiles for extrude must be closed; a revolve profile needs one centerline as its axis."""
+    Profiles for extrude must be closed; a revolve profile needs one centerline as its axis.
+    dimension=true (default) lets SOLIDWORKS add the dimensions that fully
+    define the sketch, so they can be changed later and appear in drawings."""
     doc = sw.active_doc(DOC_PART)
     doc.ClearSelection2(True)
     if face_point:
         sw.select_at(doc, "FACE", face_point, False)
     else:
-        planes = sw.standard_planes(doc)
-        target = planes.get(plane.lower()) or sw.feature(doc, plane)
+        key = plane.lower()
+        target = sw.standard_plane(doc, key) if key in sw.PLANE_NAMES else sw.feature(doc, plane)
         if not target.Select2(False, 0):
             raise RuntimeError(f"Could not select plane {plane!r}")
     sm = doc.SketchManager
     sm.InsertSketch(True)
     sm.AddToDB = True  # no snapping/inference to nearby geometry
     failed = []
+    state = None
     try:
         for i, e in enumerate(entities):
             if _sketch_entity(sm, e) is None:
                 failed.append(i)
+        sm.AddToDB = False
+        if dimension and len(failed) < len(entities):
+            state = _fully_define(sm)
     finally:
         sm.AddToDB = False
         sm.InsertSketch(True)
     feat = sw.last_feature_of_type(doc, "ProfileFeature")
-    result = {"sketch": feat.Name, "entities": len(entities) - len(failed)}
+    on = f"face at {face_point} mm" if face_point else target.Name
+    result = {"sketch": feat.Name, "on": on, "entities": len(entities) - len(failed)}
+    if state:
+        result["definition"] = state
     if failed:
         result["failed_entities"] = failed
     return result

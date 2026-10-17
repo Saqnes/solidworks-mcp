@@ -170,13 +170,40 @@ def last_feature_of_type(doc: Any, type_name: str) -> Any:
         i += 1
 
 
-def standard_planes(doc: Any) -> dict[str, Any]:
-    """The default Front/Top/Right planes, found by position rather than name
-    because their names are localized (e.g. 정면/윗면/우측면 in Korean)."""
-    planes = [f for f in iter_features(doc) if m0(f, "GetTypeName2") == "RefPlane"][:3]
-    if len(planes) < 3:
-        raise RuntimeError("Could not find the three default planes")
-    return dict(zip(("front", "top", "right"), planes))
+PLANE_NAMES = {
+    "front": ("Front Plane", "정면", "Front"),
+    "top": ("Top Plane", "윗면", "Top"),
+    "right": ("Right Plane", "우측면", "Right"),
+}
+PLANE_AXIS = {"right": 0, "top": 1, "front": 2}  # index of the plane normal (x, y, z)
+
+
+def _plane_normal_axis(f: Any) -> int | None:
+    """Axis (0=x, 1=y, 2=z) a reference plane through the origin faces, or
+    None if it is offset or tilted."""
+    try:
+        data = m0(m0(f, "GetSpecificFeature2").Transform, "ArrayData")
+    except Exception:
+        return None
+    normal, origin = data[6:9], data[9:12]
+    if any(abs(v) > 1e-9 for v in origin):
+        return None
+    axis = max(range(3), key=lambda i: abs(normal[i]))
+    return axis if abs(abs(normal[axis]) - 1) < 1e-6 else None
+
+
+def standard_plane(doc: Any, which: str) -> Any:
+    """The default Front/Top/Right plane. Tried by its English or Korean
+    name first, then by geometry (the plane through the origin facing the
+    right axis), since names depend on the template's language."""
+    for name in PLANE_NAMES[which]:
+        f = doc.FeatureByName(name)
+        if f is not None:
+            return f
+    for f in iter_features(doc):
+        if m0(f, "GetTypeName2") == "RefPlane" and _plane_normal_axis(f) == PLANE_AXIS[which]:
+            return f
+    raise LookupError(f"Could not find the {which} plane; pass its name from list_features")
 
 
 def select_feature(doc: Any, name: str, append: bool = False, mark: int = 0) -> None:
@@ -184,8 +211,54 @@ def select_feature(doc: Any, name: str, append: bool = False, mark: int = 0) -> 
         raise RuntimeError(f"Could not select {name!r}")
 
 
+def _select_entity(doc: Any, ent: Any, append: bool, mark: int) -> bool:
+    data = m0(doc.SelectionManager, "CreateSelectData")
+    data.Mark = mark
+    return bool(ent.Select4(append, data))
+
+
+def _nearest(entities: Any, point: tuple[float, float, float], where: Callable[[Any], Any]) -> tuple[float, Any]:
+    best = (math.inf, None)
+    for ent in entities or ():
+        try:
+            q = where(ent)
+        except Exception:
+            continue
+        d = math.dist(point, tuple(q[:3]))
+        if d < best[0]:
+            best = (d, ent)
+    return best
+
+
+TOLERANCE = 0.5 * MM
+
+
 def select_at(doc: Any, entity: str, point_mm: list[float], append: bool, mark: int = 0) -> None:
-    """Select the face/edge/vertex at a model-space point (mm)."""
-    x, y, z = (mm(v) for v in point_mm)
+    """Select the face/edge/vertex nearest a model-space point (mm).
+
+    In parts this searches the solid bodies directly, so it finds hidden
+    edges too; SelectByID2 only picks what is visible in the current view.
+    Assemblies fall back to SelectByID2."""
+    entity = entity.lower()
+    p = tuple(mm(v) for v in point_mm)
+    if m0(doc, "GetType") == DOC_PART:
+        best = (math.inf, None)
+        for body in doc.GetBodies2(0, False) or ():  # solid bodies, hidden ones included
+            if entity == "edge":
+                cand = _nearest(m0(body, "GetEdges"), p, lambda e: e.GetClosestPointOn(*p))
+            elif entity == "face":
+                cand = _nearest(m0(body, "GetFaces"), p, lambda f: f.GetClosestPointOn(*p))
+            elif entity == "vertex":
+                cand = _nearest(m0(body, "GetVertices"), p, lambda v: m0(v, "GetPoint"))
+            else:
+                raise ValueError(f"Unknown entity type {entity!r}")
+            best = min(best, cand, key=lambda c: c[0])
+        if best[1] is not None and best[0] <= TOLERANCE:
+            if not _select_entity(doc, best[1], append, mark):
+                raise RuntimeError(f"Found the {entity} at {point_mm} mm but could not select it")
+            return
+        if best[1] is not None:
+            raise LookupError(f"No {entity} within 0.5 mm of {point_mm} mm (nearest is {best[0] / MM:.2f} mm away)")
+    x, y, z = p
     if not doc.Extension.SelectByID2("", entity.upper(), x, y, z, append, mark, nothing(), 0):
-        raise LookupError(f"No {entity.lower()} found at {point_mm} mm")
+        raise LookupError(f"No {entity} found at {point_mm} mm")
