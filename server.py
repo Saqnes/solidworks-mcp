@@ -680,7 +680,14 @@ def _dimension_intent(doc: Any, sm: Any, entities: list[dict], created: list[Any
             if select(seg):
                 dd = place("size", cx + 1.5 * r, cy + 1.5 * r)
                 if dd is not None and len(group) > 1:
-                    dd.SetText(1, f"{len(group)}X ")  # swDimensionTextPrefix -> "4X Ø6.6"
+                    # The prefix already holds the Ø symbol; keep it after the count.
+                    try:
+                        prefix = dd.GetText(1) or ""  # swDimensionTextPrefix
+                    except Exception:
+                        prefix = ""
+                    if "<MOD-DIAM>" not in prefix:
+                        prefix = "<MOD-DIAM>" + prefix
+                    dd.SetText(1, f"{len(group)}X {prefix}")  # "4X Ø6.60"
             if len(group) > 1 and select(*(g[3] for g in group)):
                 doc.SketchAddConstraints("sgSAMELENGTH")  # equal radius
                 doc.ClearSelection2(True)
@@ -1313,7 +1320,9 @@ def measure(
 ) -> dict:
     """Measure one entity (length/area/diameter) or the distance and angle
     between two, picked by model points (mm). Distances in mm, angles in
-    degrees; values SOLIDWORKS does not report for this pair are omitted."""
+    degrees; values SOLIDWORKS does not report for this pair are omitted.
+    Between holes/arcs, center_to_center_mm and minimum_mm (wall to wall)
+    are both given."""
     doc = sw.active_doc()
     doc.ClearSelection2(True)
     sw.select_at(doc, entity1, point1, False)
@@ -1324,11 +1333,10 @@ def measure(
         raise RuntimeError("SOLIDWORKS could not measure this selection")
     out = {}
     for key, attr, scale in (
-        ("distance_mm", "Distance", 1 / MM), ("center_distance_mm", "CenterDistance", 1 / MM),
-        ("normal_distance_mm", "NormalDistance", 1 / MM), ("length_mm", "Length", 1 / MM),
-        ("diameter_mm", "Diameter", 1 / MM), ("radius_mm", "Radius", 1 / MM),
-        ("area_mm2", "Area", 1 / MM**2), ("perimeter_mm", "Perimeter", 1 / MM),
-        ("angle_deg", "Angle", 180 / math.pi),
+        ("distance_mm", "Distance", 1 / MM), ("normal_distance_mm", "NormalDistance", 1 / MM),
+        ("length_mm", "Length", 1 / MM), ("diameter_mm", "Diameter", 1 / MM),
+        ("radius_mm", "Radius", 1 / MM), ("area_mm2", "Area", 1 / MM**2),
+        ("perimeter_mm", "Perimeter", 1 / MM), ("angle_deg", "Angle", 180 / math.pi),
     ):
         try:
             v = getattr(m, attr)
@@ -1336,6 +1344,20 @@ def measure(
             continue
         if v is not None and v >= 0:  # -1 = not applicable
             out[key] = round(v * scale, 4)
+    if point2:
+        # Between arcs/cylinders the distance depends on IMeasure.ArcOption
+        # (0 centre, 1 minimum); report both under unambiguous names.
+        by_option = {}
+        for option in (0, 1):
+            try:
+                m.ArcOption = option
+                if sw.invoke(m, "Calculate", sw.nothing()) and m.Distance >= 0:
+                    by_option[option] = round(m.Distance / MM, 4)
+            except Exception:
+                pass
+        if len(set(by_option.values())) == 2:
+            centre, minimum = by_option[0], by_option[1]
+            out["center_to_center_mm"], out["minimum_mm"] = max(centre, minimum), min(centre, minimum)
     doc.ClearSelection2(True)
     return out
 
