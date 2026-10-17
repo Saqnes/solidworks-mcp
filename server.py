@@ -1013,6 +1013,382 @@ def make_drawing(model_path: str = "", projection: Literal["third_angle", "first
     return sw.doc_info(drw)
 
 
+# --- Patterns, reference geometry and other features ------------------------
+
+# COM errors meaning "this API has a different signature here": bad parameter
+# count, member not found, type mismatch.
+_SIGNATURE_ERRORS = {-2147352562, -2147352573, -2147352571}
+
+
+def _call_first(obj: Any, variants: list[tuple[str, tuple]]) -> Any:
+    """Call the first (method, args) the installed SOLIDWORKS accepts. Some
+    feature methods gained arguments between releases."""
+    last: Exception | None = None
+    for name, args in variants:
+        try:
+            return getattr(obj, name)(*args)
+        except AttributeError as exc:
+            last = exc
+        except Exception as exc:
+            code = getattr(exc, "hresult", None) or (exc.args[0] if exc.args else None)
+            if code not in _SIGNATURE_ERRORS:
+                raise
+            last = exc
+    raise RuntimeError(f"none of {[v[0] for v in variants]} accepted these arguments ({last})")
+
+
+def _select_direction(doc: Any, direction: str, mark: int, append: bool) -> None:
+    """Select a direction reference: "x"/"y"/"z" (via the default plane whose
+    normal it is), a plane/axis feature name, or "edge:x,y,z" (mm)."""
+    if direction.startswith("edge:"):
+        sw.select_at(doc, "EDGE", [float(v) for v in direction[5:].split(",")], append, mark)
+        return
+    plane = {"x": "right", "y": "top", "z": "front"}.get(direction.lower())
+    feat = sw.standard_plane(doc, plane) if plane else sw.feature(doc, direction)
+    if not feat.Select2(append, mark):
+        raise RuntimeError(f"Could not select direction {direction!r}")
+
+
+def _select_features(doc: Any, names: list[str], mark: int, append: bool = True) -> None:
+    for name in names:
+        sw.select_feature(doc, name, append=append, mark=mark)
+        append = True
+
+
+@tool
+def linear_pattern(
+    features: list[str],
+    direction: str,
+    count: int,
+    spacing: float,
+    direction2: str = "",
+    count2: int = 1,
+    spacing2: float = 10.0,
+    reverse: bool = False,
+    reverse2: bool = False,
+) -> dict:
+    """Repeat features (by name, e.g. ["컷-돌출1"]) in a line. direction is
+    "x"/"y"/"z", a plane/axis name, or "edge:x,y,z" (a model edge through
+    that point, mm). count includes the original; spacing in mm. An optional
+    second direction makes a grid."""
+    doc = sw.active_doc(DOC_PART)
+    doc.ClearSelection2(True)
+    _select_direction(doc, direction, 1, False)
+    if direction2:
+        _select_direction(doc, direction2, 2, True)
+    _select_features(doc, features, 4)
+    n2 = count2 if direction2 else 1
+    base = (count, mm(spacing), n2, mm(spacing2), reverse, reverse2, "NULL", "NULL",
+            False, False, False, False, False, False, True, True, False, False, 0, 0)
+    feat = _call_first(doc.FeatureManager, [
+        ("FeatureLinearPattern5", base + (False, False)),
+        ("FeatureLinearPattern4", base),
+    ])
+    return _feature_result(feat, "linear pattern")
+
+
+def _axis(doc: Any, axis: str) -> Any:
+    """A new reference axis along x/y/z through the origin, at the
+    intersection of two default planes."""
+    planes = {"x": ("top", "front"), "y": ("front", "right"), "z": ("top", "right")}[axis]
+    doc.ClearSelection2(True)
+    for i, p in enumerate(planes):
+        sw.standard_plane(doc, p).Select2(i > 0, 0)
+    if not doc.InsertAxis2(True):
+        raise RuntimeError(f"Could not create the {axis} axis")
+    doc.ClearSelection2(True)
+    return sw.last_feature_of_type(doc, "RefAxis")
+
+
+@tool
+def circular_pattern(features: list[str], count: int, axis: str = "y", angle: float = 360.0, reverse: bool = False) -> dict:
+    """Repeat features around an axis: "x"/"y"/"z" (through the origin; a
+    reference axis is created), an axis feature name, or "face:x,y,z" (the
+    axis of the cylindrical face through that point, mm). count includes the
+    original; the instances are spread evenly over `angle` degrees."""
+    doc = sw.active_doc(DOC_PART)
+    if axis.lower() in ("x", "y", "z"):
+        axis_feat = _axis(doc, axis.lower())
+        doc.ClearSelection2(True)
+        axis_feat.Select2(False, 1)
+    elif axis.startswith("face:"):
+        doc.ClearSelection2(True)
+        sw.select_at(doc, "FACE", [float(v) for v in axis[5:].split(",")], False, 1)
+    else:
+        doc.ClearSelection2(True)
+        sw.select_feature(doc, axis, mark=1)
+    _select_features(doc, features, 4)
+    total = deg(angle)
+    feat = _call_first(doc.FeatureManager, [
+        ("FeatureCircularPattern5", (count, total, reverse, "NULL", False, True, False, False, False, False, 1, total, "NULL", False)),
+        ("FeatureCircularPattern4", (count, total, reverse, "NULL", False, True, False)),
+    ])
+    return _feature_result(feat, "circular pattern")
+
+
+@tool
+def mirror(features: list[str], plane: str = "right", face_point: list[float] | None = None) -> dict:
+    """Mirror features (by name) about "front"/"top"/"right", a plane name,
+    or the planar face at face_point (mm)."""
+    doc = sw.active_doc(DOC_PART)
+    doc.ClearSelection2(True)
+    if face_point:
+        sw.select_at(doc, "FACE", face_point, False, 2)
+    else:
+        key = plane.lower()
+        target = sw.standard_plane(doc, key) if key in sw.PLANE_NAMES else sw.feature(doc, plane)
+        target.Select2(False, 2)
+    _select_features(doc, features, 1)
+    feat = _call_first(doc.FeatureManager, [
+        ("InsertMirrorFeature2", (False, False, False, False, 0)),
+        ("InsertMirrorFeature", (False, False, False, False)),
+    ])
+    return _feature_result(feat, "mirror")
+
+
+@tool
+def shell(thickness: float, open_face_points: list[list[float]] | None = None, outward: bool = False) -> dict:
+    """Hollow the part to a wall `thickness` (mm), removing the faces through
+    the given points (e.g. the top face to make an open box)."""
+    doc = sw.active_doc(DOC_PART)
+    doc.ClearSelection2(True)
+    for i, p in enumerate(open_face_points or []):
+        sw.select_at(doc, "FACE", p, append=i > 0, mark=0)
+    before = doc.FeatureByPositionReverse(0).Name
+    doc.InsertFeatureShell(mm(thickness), outward)
+    feat = doc.FeatureByPositionReverse(0)
+    return _feature_result(feat if feat.Name != before else None, "shell")
+
+
+@tool
+def offset_plane(distance: float, plane: str = "top", face_point: list[float] | None = None, reverse: bool = False) -> dict:
+    """Create a reference plane `distance` mm from a plane ("front"/"top"/
+    "right" or a name) or from the planar face at face_point; sketch on it by
+    passing the returned name to sketch(plane=...)."""
+    doc = sw.active_doc(DOC_PART)
+    doc.ClearSelection2(True)
+    if face_point:
+        sw.select_at(doc, "FACE", face_point, False, 0)
+    else:
+        key = plane.lower()
+        target = sw.standard_plane(doc, key) if key in sw.PLANE_NAMES else sw.feature(doc, plane)
+        target.Select2(False, 0)
+    # swRefPlaneReferenceConstraint_Distance, plus OptionFlip to go the other way
+    feat = doc.FeatureManager.InsertRefPlane(8 | (256 if reverse else 0), mm(distance), 0, 0, 0, 0)
+    return _feature_result(feat, "reference plane")
+
+
+@tool
+def reference_axis(axis: Literal["x", "y", "z"]) -> dict:
+    """Create a reference axis along x/y/z through the origin (for patterns,
+    revolves or mates)."""
+    return _feature_result(_axis(sw.active_doc(DOC_PART), axis), "reference axis")
+
+
+# --- Equations, global variables and configurations -------------------------
+
+
+def _equations(eqm: Any) -> list[dict]:
+    out = []
+    for i in range(sw.m0(eqm, "GetCount")):
+        try:
+            value = eqm.Value(i)
+        except Exception:
+            value = None
+        out.append({"index": i, "equation": eqm.Equation(i), "value": value})
+    return out
+
+
+@tool
+def list_equations() -> list[dict]:
+    """Global variables and equations of the active document."""
+    return _equations(sw.m0(sw.active_doc(), "GetEquationMgr"))
+
+
+@tool
+def set_equation(lhs: str, rhs: str) -> list[dict]:
+    """Add or replace an equation. Global variable: lhs="Width", rhs="120".
+    Drive a dimension: lhs="D1@스케치2", rhs='"Width"' or '"Width" / 2 + 5'.
+    Names are quoted automatically on the left; quote variable/dimension
+    names yourself inside rhs. Values are in document units (mm)."""
+    doc = sw.active_doc()
+    eqm = sw.m0(doc, "GetEquationMgr")
+    left = lhs if lhs.startswith('"') else f'"{lhs}"'
+    text = f"{left} = {rhs}"
+    for e in _equations(eqm):
+        if e["equation"].split("=", 1)[0].strip().lower() == left.lower():
+            eqm.Delete(e["index"])
+            if eqm.Add2(e["index"], text, True) < 0:
+                raise RuntimeError(f"SOLIDWORKS rejected {text!r}")
+            break
+    else:
+        if eqm.Add2(-1, text, True) < 0:
+            raise RuntimeError(f"SOLIDWORKS rejected {text!r}")
+    _rebuild(doc)
+    return _equations(eqm)
+
+
+@tool
+def delete_equation(lhs: str) -> list[dict]:
+    """Remove the equation or global variable whose left side is `lhs`."""
+    doc = sw.active_doc()
+    eqm = sw.m0(doc, "GetEquationMgr")
+    left = (lhs if lhs.startswith('"') else f'"{lhs}"').lower()
+    for e in _equations(eqm):
+        if e["equation"].split("=", 1)[0].strip().lower() == left:
+            eqm.Delete(e["index"])
+            _rebuild(doc)
+            return _equations(eqm)
+    raise LookupError(f"No equation for {lhs!r}")
+
+
+@tool
+def configurations(add: str = "", activate: str = "") -> dict:
+    """List configurations; optionally add one (it becomes active) or
+    activate an existing one. Suppression and dimension changes made while a
+    configuration is active apply to that configuration."""
+    doc = sw.active_doc()
+    if add:
+        if doc.AddConfiguration3(add, "", "", 0) is None:
+            raise RuntimeError(f"Could not add configuration {add!r}")
+    if activate and not doc.ShowConfiguration2(activate):
+        raise LookupError(f"No configuration {activate!r}")
+    return {
+        "configurations": list(sw.m0(doc, "GetConfigurationNames") or ()),
+        "active": doc.ConfigurationManager.ActiveConfiguration.Name,
+    }
+
+
+# --- Checking -----------------------------------------------------------------
+
+
+@tool
+def measure(
+    point1: list[float],
+    point2: list[float] | None = None,
+    entity1: Literal["face", "edge", "vertex"] = "face",
+    entity2: Literal["face", "edge", "vertex"] = "face",
+) -> dict:
+    """Measure one entity (length/area/diameter) or the distance and angle
+    between two, picked by model points (mm). Distances in mm, angles in
+    degrees; values SOLIDWORKS does not report for this pair are omitted."""
+    doc = sw.active_doc()
+    doc.ClearSelection2(True)
+    sw.select_at(doc, entity1, point1, False)
+    if point2:
+        sw.select_at(doc, entity2, point2, True)
+    m = sw.m0(doc.Extension, "CreateMeasure")
+    if not m.Calculate(sw.nothing()):
+        raise RuntimeError("SOLIDWORKS could not measure this selection")
+    out = {}
+    for key, attr, scale in (
+        ("distance_mm", "Distance", 1 / MM), ("center_distance_mm", "CenterDistance", 1 / MM),
+        ("normal_distance_mm", "NormalDistance", 1 / MM), ("length_mm", "Length", 1 / MM),
+        ("diameter_mm", "Diameter", 1 / MM), ("radius_mm", "Radius", 1 / MM),
+        ("area_mm2", "Area", 1 / MM**2), ("perimeter_mm", "Perimeter", 1 / MM),
+        ("angle_deg", "Angle", 180 / math.pi),
+    ):
+        try:
+            v = getattr(m, attr)
+        except Exception:
+            continue
+        if v is not None and v >= 0:  # -1 = not applicable
+            out[key] = round(v * scale, 4)
+    doc.ClearSelection2(True)
+    return out
+
+
+@tool
+def check_interference() -> list[dict]:
+    """Interferences between components of the active assembly (touching
+    faces are not counted), with the overlap volume."""
+    asm = sw.active_doc(DOC_ASSEMBLY)
+    idm = asm.InterferenceDetectionManager
+    idm.TreatCoincidenceAsInterference = False
+    out = []
+    try:
+        for intf in sw.m0(idm, "GetInterferences") or ():
+            out.append({
+                "components": [c.Name2 for c in (intf.Components or ())],
+                "volume_mm3": round(intf.Volume / MM**3, 3),
+            })
+    finally:
+        sw.m0(idm, "Done")
+    return out
+
+
+@tool
+def bom() -> list[dict]:
+    """Bill of materials of the active assembly: each part/subassembly file
+    and configuration with its quantity (suppressed components excluded)."""
+    asm = sw.active_doc(DOC_ASSEMBLY)
+    counts: dict[tuple[str, str], int] = {}
+    for c in asm.GetComponents(False) or ():
+        if sw.m0(c, "IsSuppressed"):
+            continue
+        key = (sw.m0(c, "GetPathName"), c.ReferencedConfiguration)
+        counts[key] = counts.get(key, 0) + 1
+    return [
+        {"file": Path(path).name, "configuration": cfg, "quantity": n, "path": path}
+        for (path, cfg), n in sorted(counts.items(), key=lambda kv: Path(kv[0][0]).name.lower())
+    ]
+
+
+# --- Appearance and batch work ------------------------------------------------
+
+
+@tool
+def set_color(rgb: list[int]) -> str:
+    """Colour the whole active part, e.g. [200, 30, 30]."""
+    doc = sw.active_doc(DOC_PART)
+    r, g, b = (max(0, min(255, int(v))) / 255 for v in rgb)
+    # red, green, blue, ambient, diffuse, specular, shininess, transparency, emission
+    doc.MaterialPropertyValues = sw.doubles((r, g, b, 1, 1, 0.5, 0.4, 0, 0))
+    sw.m0(doc, "GraphicsRedraw2")
+    return f"coloured {sw.m0(doc, 'GetTitle')} {list(rgb)}"
+
+
+@tool
+def export_folder(folder: str, extension: str = "step", recursive: bool = False, overwrite: bool = False) -> list[dict]:
+    """Export every .sldprt/.sldasm in a folder to another format (step,
+    igs, x_t, stl, 3mf, pdf ...), next to the originals. Files already open
+    stay open; others are opened silently and closed again."""
+    app = sw.app()
+    previous = app.ActiveDoc
+    open_docs = {os.path.normcase(sw.m0(d, "GetPathName")): d for d in (sw.m0(app, "GetDocuments") or ()) if sw.m0(d, "GetPathName")}
+    pattern = "**/*" if recursive else "*"
+    files = [p for p in Path(folder).glob(pattern) if p.suffix.lower() in (".sldprt", ".sldasm") and not p.name.startswith("~$")]
+    if not files:
+        raise LookupError(f"No .sldprt/.sldasm files in {folder}")
+    results = []
+    for src in sorted(files):
+        target = src.with_suffix("." + extension.lstrip("."))
+        if target.exists() and not overwrite:
+            results.append({"file": src.name, "skipped": f"{target.name} exists"})
+            continue
+        doc = open_docs.get(os.path.normcase(str(src)))
+        opened_here = doc is None
+        try:
+            if opened_here:
+                errors, warnings = sw.out_int(), sw.out_int()
+                doc = app.OpenDoc6(str(src), sw.DOC_TYPES[src.suffix.lower()], 1, "", errors, warnings)
+                if doc is None:
+                    results.append({"file": src.name, "error": f"open failed (swFileLoadError {errors.value})"})
+                    continue
+            errors, warnings = sw.out_int(), sw.out_int()
+            ok = doc.Extension.SaveAs3(str(target), 0, 1 | 2, sw.nothing(), sw.nothing(), errors, warnings)
+            if ok and target.exists():
+                results.append({"file": src.name, "exported": target.name, "bytes": target.stat().st_size})
+            else:
+                results.append({"file": src.name, "error": _save_error(errors.value)})
+        finally:
+            if opened_here and doc is not None:
+                app.CloseDoc(sw.m0(doc, "GetTitle"))
+    if previous is not None:
+        app.ActivateDoc3(sw.m0(previous, "GetTitle"), False, 0, sw.out_int())
+    return results
+
+
 # --- Escape hatches -------------------------------------------------------
 
 

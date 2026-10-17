@@ -13,7 +13,11 @@ SOLIDWORKS 2025 SP2 기준으로 작성했습니다.
 | 문서 | `status`, `list_documents`, `new_document`, `open_document`, `activate_document`, `save`, `export`, `close_document` |
 | 확인 | `list_features`, `list_dimensions`, `model_info`(질량·부피·무게중심·바운딩박스·재질), `screenshot`(뷰 방향 지정 가능) |
 | 수정 | `set_dimension`, `rebuild`, `undo`, `delete_feature`, `suppress_feature`, `list_materials`, `set_material`, `custom_properties` |
-| 파트 모델링 | `sketch`(선·중심선·사각형·원·호·다각형·슬롯·점, 평면 또는 면 위, 치수 자동 기입), `extrude`(보스/컷, 블라인드·관통·중간평면·구배), `revolve`, `fillet`, `chamfer` |
+| 파트 모델링 | `sketch`(선·중심선·사각형·원·호·다각형·슬롯·점, 평면 또는 면 위, 설계 의도 치수·대칭 구속 자동), `extrude`(보스/컷, 블라인드·관통·중간평면·구배), `revolve`, `fillet`, `chamfer`, `shell` |
+| 패턴·참조 | `linear_pattern`, `circular_pattern`, `mirror`, `offset_plane`, `reference_axis` |
+| 설계 변수 | `list_equations`, `set_equation`(전역 변수·치수 연결), `delete_equation`, `configurations` |
+| 검사 | `measure`(거리·각도·길이·면적·지름), `check_interference`(어셈블리 간섭), `bom`(부품 수량표) |
+| 기타 | `set_color`, `export_folder`(폴더 일괄 STEP/STL 등 변환) |
 | 어셈블리 | `insert_component`, `list_components`, `add_mate`(일치·동심·거리·각도 등) |
 | 도면 | `make_drawing`(3도 투상, 모델 치수 가져오기) → `export`로 PDF/DXF |
 | 만능 | `run_api_script`(SOLIDWORKS API를 Python으로 직접 호출), `run_macro`(.swp 실행) |
