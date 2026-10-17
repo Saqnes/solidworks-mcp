@@ -76,6 +76,14 @@ def out_bstr() -> Any:
     return VARIANT(pythoncom.VT_BYREF | pythoncom.VT_BSTR, "")
 
 
+def doubles(values: Any) -> Any:
+    """A SAFEARRAY of doubles, e.g. for MathUtility.CreatePoint."""
+    import pythoncom
+    from win32com.client import VARIANT
+
+    return VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, tuple(float(v) for v in values))
+
+
 def mm(v: float) -> float:
     return float(v) * MM
 

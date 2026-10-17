@@ -506,6 +506,92 @@ def _datum_lines(segments: list[Any]) -> tuple[Any, Any]:
     return (left[1] if left else None), (bottom[1] if bottom else None)
 
 
+INPUT_DIM_ON_CREATE = 10  # swUserPreferenceToggle_e.swInputDimValOnCreate
+
+
+def _to_model(sk: Any, x: float, y: float) -> tuple[float, float, float]:
+    """Sketch coordinates (m) to model coordinates, for placing dimension text."""
+    try:
+        mu = sw.m0(sw.app(), "GetMathUtility")
+        pt = mu.CreatePoint(sw.doubles((x, y, 0.0)))
+        inv = sw.m0(sw.m0(sk, "ModelToSketchTransform"), "Inverse")
+        return tuple(sw.m0(pt.MultiplyTransform(inv), "ArrayData"))[:3]
+    except Exception:
+        return (x, y, 0.0)
+
+
+def _dimension_intent(doc: Any, sm: Any, entities: list[dict], created: list[Any]) -> tuple[int, list[str]]:
+    """Add the dimensions a designer would: overall width/height of
+    rectangles, one diameter per hole size (equal relations for the rest)
+    and the spacing between the outermost holes. FullyDefineSketch then only
+    has to locate things. Returns (dimensions added, problems)."""
+    sk = sm.ActiveSketch
+    off = 8 * MM  # how far dimension text sits from the geometry
+    added, notes = 0, []
+
+    def place(kind: str, x: float, y: float) -> None:
+        nonlocal added
+        add = {"size": doc.AddDimension2, "h": doc.AddHorizontalDimension2, "v": doc.AddVerticalDimension2}[kind]
+        if add(*_to_model(sk, x, y)) is not None:
+            added += 1
+        else:
+            notes.append(f"{kind} dimension at ({x / MM:.1f}, {y / MM:.1f}) mm not added")
+        doc.ClearSelection2(True)
+
+    def select(*ents: Any) -> bool:
+        doc.ClearSelection2(True)
+        return all(sw._select_entity(doc, e, i > 0, 0) for i, e in enumerate(ents))
+
+    circles = []
+    for spec, made in zip(entities, created):
+        try:
+            if spec.get("type") in ("rectangle", "center_rectangle") and made:
+                left, bottom = _datum_lines(_flatten([made]))
+                if bottom is not None and select(bottom):
+                    a, b = sw.m0(bottom, "GetStartPoint2"), sw.m0(bottom, "GetEndPoint2")
+                    place("size", (a.X + b.X) / 2, a.Y - off)
+                if left is not None and select(left):
+                    a, b = sw.m0(left, "GetStartPoint2"), sw.m0(left, "GetEndPoint2")
+                    place("size", a.X - off, (a.Y + b.Y) / 2)
+            elif spec.get("type") == "circle" and made is not None:
+                circles.append((mm(spec.get("cx", 0)), mm(spec.get("cy", 0)), mm(spec["r"]), made))
+        except Exception as exc:
+            notes.append(f"{spec.get('type')}: {exc}")
+            doc.ClearSelection2(True)
+
+    by_size: dict[float, list] = {}
+    for c in circles:
+        by_size.setdefault(round(c[2], 9), []).append(c)
+    for r, group in by_size.items():
+        try:
+            cx, cy, _, seg = group[0]
+            if select(seg):
+                place("size", cx + 1.5 * r, cy + 1.5 * r)
+            if len(group) > 1 and select(*(g[3] for g in group)):
+                doc.SketchAddConstraints("sgSAMELENGTH")  # equal radius
+                doc.ClearSelection2(True)
+        except Exception as exc:
+            notes.append(f"circle diameter: {exc}")
+            doc.ClearSelection2(True)
+
+    if len(circles) > 1:
+        try:
+            low = min(c[1] for c in circles)
+            row = [c for c in circles if abs(c[1] - low) < 1e-9]  # bottom row
+            a, b = min(row, key=lambda c: c[0]), max(row, key=lambda c: c[0])
+            if b[0] - a[0] > 1e-9 and select(sw.m0(a[3], "GetCenterPoint2"), sw.m0(b[3], "GetCenterPoint2")):
+                place("h", (a[0] + b[0]) / 2, low - a[2] - off)
+            left_x = min(c[0] for c in circles)
+            col = [c for c in circles if abs(c[0] - left_x) < 1e-9]  # left column
+            a, b = min(col, key=lambda c: c[1]), max(col, key=lambda c: c[1])
+            if b[1] - a[1] > 1e-9 and select(sw.m0(a[3], "GetCenterPoint2"), sw.m0(b[3], "GetCenterPoint2")):
+                place("v", left_x - a[2] - off, (a[1] + b[1]) / 2)
+        except Exception as exc:
+            notes.append(f"hole spacing: {exc}")
+            doc.ClearSelection2(True)
+    return added, notes
+
+
 def _fully_define(sm: Any, segments: list[Any]) -> str:
     """Let SOLIDWORKS add the dimensions/relations that fully define the
     open sketch (so they show up in drawings). Returns the resulting state."""
@@ -577,7 +663,16 @@ def _draw(doc: Any, entities: list[dict], dimension: bool) -> tuple[Any, list[in
             created.append(made)
         sm.AddToDB = False
         if dimension and len(failed) < len(entities):
+            app = sw.app()
+            prompt = app.GetUserPreferenceToggle(INPUT_DIM_ON_CREATE)
+            app.SetUserPreferenceToggle(INPUT_DIM_ON_CREATE, False)  # no "Modify" dialog per dimension
+            try:
+                added, notes = _dimension_intent(doc, sm, entities, created)
+            finally:
+                app.SetUserPreferenceToggle(INPUT_DIM_ON_CREATE, prompt)
             state = _fully_define(sm, _flatten(created))
+            if notes:
+                state = f"{state}; added {added} dimensions, problems: {'; '.join(notes)}"
     finally:
         sm.AddToDB = False
         sm.InsertSketch(True)
@@ -595,8 +690,11 @@ def sketch(entities: list[dict], plane: str = "front", face_point: list[float] |
       {"type":"arc","cx","cy","x1","y1","x2","y2","clockwise":false}
       {"type":"slot","x1","y1","x2","y2","width"}  {"type":"point","x","y"}
     Profiles for extrude must be closed; a revolve profile needs one centerline as its axis.
-    dimension=true (default) lets SOLIDWORKS add the dimensions that fully
-    define the sketch, so they can be changed later and appear in drawings.
+    dimension=true (default) adds design-intent dimensions (overall
+    rectangle width/height, one diameter per hole size with equal relations,
+    spacing between the outer holes) and lets SOLIDWORKS add the rest needed
+    to fully define the sketch, so they can be changed later and appear in
+    drawings. If a rectangle is the first entity, its width/height become D1/D2.
     The result's "normal" is the model axis the sketch actually faces."""
     doc = sw.active_doc(DOC_PART)
     target, expected = None, None
