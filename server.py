@@ -14,6 +14,7 @@ import io
 import math
 import os
 import tempfile
+import time
 import traceback
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -121,6 +122,35 @@ def activate_document(title: str) -> dict:
     return sw.doc_info(doc)
 
 
+SAVE_ERRORS = {
+    1: "generic save error", 2: "file is read-only", 4: "file name is empty",
+    8: "file name contains '@'", 16: "file is locked by another program or user",
+    32: "format not available", 128: "target exists and may not be overwritten",
+    256: "invalid file extension", 1024: "bad eDrawings version",
+    2048: "path is too long", 4096: "this document type cannot be saved in that format",
+    8192: "referenced documents must be saved first",
+}
+
+
+def _save_error(code: int) -> str:
+    reasons = [text for bit, text in SAVE_ERRORS.items() if code & bit]
+    return f"swFileSaveError {code}: {', '.join(reasons) or 'unknown'}"
+
+
+def _check_not_open_elsewhere(doc: Any, target: str) -> None:
+    """A path open in SOLIDWORKS as another document cannot be written."""
+    norm = os.path.normcase(os.path.abspath(target))
+    for other in sw.m0(sw.app(), "GetDocuments") or ():
+        path = sw.m0(other, "GetPathName")
+        if path and os.path.normcase(os.path.abspath(path)) == norm and sw.m0(other, "GetTitle") != sw.m0(doc, "GetTitle"):
+            raise RuntimeError(
+                f"{target} is open in SOLIDWORKS as {sw.m0(other, 'GetTitle')!r}; "
+                "close it first (close_document) or choose another name"
+            )
+    if os.path.exists(target) and not os.access(target, os.W_OK):
+        raise RuntimeError(f"{target} is read-only")
+
+
 @tool
 def save(path: str = "") -> dict:
     """Save the active document; with a path (same file type), save it there
@@ -128,13 +158,14 @@ def save(path: str = "") -> dict:
     doc = sw.active_doc()
     errors, warnings = sw.out_int(), sw.out_int()
     if path:
+        _check_not_open_elsewhere(doc, str(Path(path)))
         ok = doc.Extension.SaveAs3(str(Path(path)), 0, 1, sw.nothing(), sw.nothing(), errors, warnings)
     else:
         if not sw.m0(doc, "GetPathName"):
             raise ValueError("Document was never saved; give a path")
         ok = doc.Save3(1, errors, warnings)
     if not ok:
-        raise RuntimeError(f"Save failed (swFileSaveError {errors.value})")
+        raise RuntimeError(f"Save failed ({_save_error(errors.value)})")
     return {**sw.doc_info(doc), "warnings": warnings.value}
 
 
@@ -146,9 +177,10 @@ def export(path: str) -> dict:
     doc = sw.active_doc()
     errors, warnings = sw.out_int(), sw.out_int()
     target = str(Path(path))
+    _check_not_open_elsewhere(doc, target)
     ok = doc.Extension.SaveAs3(target, 0, 1 | 2, sw.nothing(), sw.nothing(), errors, warnings)  # silent | copy
     if not ok or not os.path.exists(target):
-        raise RuntimeError(f"Export failed (swFileSaveError {errors.value}) for {target}")
+        raise RuntimeError(f"Export failed ({_save_error(errors.value)}) for {target}")
     return {"path": target, "bytes": os.path.getsize(target), "warnings": warnings.value}
 
 
@@ -198,8 +230,11 @@ def _dim_value(dim: Any) -> tuple[float, str]:
 @tool
 def list_dimensions(feature: str = "") -> list[dict]:
     """Dimensions of all features (or one feature), with names usable in
-    set_dimension, e.g. "D1@Sketch1" (localized: "D1@스케치1")."""
+    set_dimension, e.g. "D1@Sketch1" (localized: "D1@스케치1"). In a drawing,
+    lists the dimensions shown in each view instead."""
     doc = sw.active_doc()
+    if sw.m0(doc, "GetType") == DOC_DRAWING:
+        return _drawing_dimensions(doc)
     feats = [sw.feature(doc, feature)] if feature else list(sw.iter_features(doc))
     out = []
     for f in feats:
@@ -209,6 +244,20 @@ def list_dimensions(feature: str = "") -> list[dict]:
             value, unit = _dim_value(dim)
             out.append({"name": "@".join(dim.FullName.split("@")[:2]), "value": value, "unit": unit, "feature": f.Name})
             dd = f.GetNextDisplayDimension(dd)
+    return out
+
+
+def _drawing_dimensions(drw: Any) -> list[dict]:
+    out = []
+    view = sw.m0(drw, "GetFirstView")  # the sheet itself, then each view
+    while view is not None:
+        dd = sw.m0(view, "GetFirstDisplayDimension5")
+        while dd is not None:
+            dim = dd.GetDimension2(0)
+            value, unit = _dim_value(dim)
+            out.append({"view": view.Name, "name": "@".join(dim.FullName.split("@")[:2]), "value": value, "unit": unit})
+            dd = sw.m0(dd, "GetNext5")
+        view = sw.m0(view, "GetNextView")
     return out
 
 
@@ -427,18 +476,52 @@ def _sketch_entity(sm: Any, e: dict) -> Any:
     raise ValueError(f"Unknown sketch entity type {t!r}")
 
 
-def _fully_define(sm: Any) -> str:
+def _flatten(created: list[Any]) -> list[Any]:
+    out = []
+    for c in created:
+        if isinstance(c, (tuple, list)):
+            out.extend(x for x in c if x is not None)
+        elif c is not None and not isinstance(c, bool):
+            out.append(c)
+    return out
+
+
+def _datum_lines(segments: list[Any]) -> tuple[Any, Any]:
+    """The leftmost vertical and lowest horizontal solid lines, used as
+    dimension datums so a rectangle gets its overall width/height and
+    features are located from its edges, as on a drawing."""
+    left = bottom = None
+    for seg in segments:
+        try:
+            if sw.m0(seg, "GetType") != 0 or seg.ConstructionGeometry:  # swSketchLINE
+                continue
+            a, b = sw.m0(seg, "GetStartPoint2"), sw.m0(seg, "GetEndPoint2")
+            (x1, y1), (x2, y2) = (a.X, a.Y), (b.X, b.Y)
+        except Exception:
+            continue
+        if abs(x1 - x2) < 1e-9 and (left is None or x1 < left[0]):
+            left = (x1, seg)
+        elif abs(y1 - y2) < 1e-9 and (bottom is None or y1 < bottom[0]):
+            bottom = (y1, seg)
+    return (left[1] if left else None), (bottom[1] if bottom else None)
+
+
+def _fully_define(sm: Any, segments: list[Any]) -> str:
     """Let SOLIDWORKS add the dimensions/relations that fully define the
     open sketch (so they show up in drawings). Returns the resulting state."""
     sk = sm.ActiveSketch
+    left, bottom = _datum_lines(segments)
+    datums = [(left or sw.nothing(), bottom or sw.nothing())]
+    if left is not None or bottom is not None:
+        datums.append((sw.nothing(), sw.nothing()))  # fall back to the origin
     # FullyDefineSketch(Relations, Dimensions, RelationsToAdd, VerticalAndHorizontal,
     #   HorizontalScheme, HorizontalDatum, VerticalScheme, VerticalDatum,
     #   HorizontalPlacement, VerticalPlacement); datum Nothing = sketch origin.
     # Enum values are tried from baseline/below/left down to all-zero defaults.
     error = None
-    for scheme, hplace, vplace in ((1, 1, 1), (0, 0, 0)):
+    for (hdatum, vdatum), (scheme, hplace, vplace) in ((d, e) for d in datums for e in ((1, 1, 1), (0, 0, 0))):
         try:
-            sm.FullyDefineSketch(True, True, 1023, True, scheme, sw.nothing(), scheme, sw.nothing(), hplace, vplace)
+            sm.FullyDefineSketch(True, True, 1023, True, scheme, hdatum, scheme, vdatum, hplace, vplace)
             error = None
             break
         except Exception as exc:
@@ -472,22 +555,29 @@ def _select_plane(doc: Any, target: Any) -> None:
         raise RuntimeError(f"Could not select plane {target.Name!r}")
 
 
+class SketchNotOpened(Exception):
+    pass
+
+
 def _draw(doc: Any, entities: list[dict], dimension: bool) -> tuple[Any, list[int], str | None]:
     """Open a sketch on the current selection, draw, optionally dimension, close."""
     sm = doc.SketchManager
     sm.InsertSketch(True)
     if sm.ActiveSketch is None:
-        raise RuntimeError("SOLIDWORKS did not open a sketch on the selected plane/face")
+        raise SketchNotOpened()
     sm.AddToDB = True  # no snapping/inference to nearby geometry
     failed: list[int] = []
+    created: list[Any] = []
     state = None
     try:
         for i, e in enumerate(entities):
-            if _sketch_entity(sm, e) is None:
+            made = _sketch_entity(sm, e)
+            if made is None:
                 failed.append(i)
+            created.append(made)
         sm.AddToDB = False
         if dimension and len(failed) < len(entities):
-            state = _fully_define(sm)
+            state = _fully_define(sm, _flatten(created))
     finally:
         sm.AddToDB = False
         sm.InsertSketch(True)
@@ -517,13 +607,23 @@ def sketch(entities: list[dict], plane: str = "front", face_point: list[float] |
         else:
             target = sw.feature(doc, plane)
             expected = sw._plane_normal_axis(target)
+    # A freshly created part sometimes is not ready for sketching yet: make
+    # sure it is the active window and retry opening the sketch briefly.
+    sw.app().ActivateDoc3(sw.m0(doc, "GetTitle"), False, 0, sw.out_int())
     for attempt in range(2):
-        doc.ClearSelection2(True)
-        if face_point:
-            sw.select_at(doc, "FACE", face_point, False)
-        else:
-            _select_plane(doc, target)
-        feat, failed, state = _draw(doc, entities, dimension)
+        for opening in range(3):
+            doc.ClearSelection2(True)
+            if face_point:
+                sw.select_at(doc, "FACE", face_point, False)
+            else:
+                _select_plane(doc, target)
+            try:
+                feat, failed, state = _draw(doc, entities, dimension)
+                break
+            except SketchNotOpened:
+                if opening == 2:
+                    raise RuntimeError("SOLIDWORKS did not open a sketch on the selected plane/face (3 tries)")
+                time.sleep(0.5)
         actual = _sketch_normal_axis(feat)
         if expected is None or actual is None or actual == expected:
             break
