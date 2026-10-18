@@ -1336,15 +1336,16 @@ def _sheet_size(drw: Any) -> tuple[float, float]:
 
 
 def _free_spot(drw: Any, width: float, height: float, exclude: str = "",
-               near: tuple[float, float] | None = None, axis: str = "") -> tuple[float, float]:
+               near: tuple[float, float] | None = None, axis: str = "",
+               extra: list | None = None, margin: float = 0.01) -> tuple[float, float]:
     """Centre (m) of a free area of the given size on the sheet, clear of the
     views (and their annotations) by a gap; the free spot closest to `near`
     (default the sheet's top right). axis "x" keeps near's y (search along
     x), "y" keeps near's x: for views SOLIDWORKS keeps aligned. Falls back to
     the sheet's top right corner."""
     sheet_w, sheet_h = _sheet_size(drw)
-    boxes = [sw.m0(v, "GetOutline") for v in _drawing_views(drw) if v.Name != exclude]
-    gap, margin, step = 0.012, 0.01, 0.005
+    boxes = [sw.m0(v, "GetOutline") for v in _drawing_views(drw) if v.Name != exclude] + list(extra or [])
+    gap, step = 0.012, 0.005
     hw, hh = width / 2 + gap, height / 2 + gap
     target = near or (sheet_w, sheet_h)
     best, best_d = None, math.inf
@@ -1396,11 +1397,13 @@ def drawing_view(
     position: list[float] | None = None,
     scale: str = "",
     model_path: str = "",
+    exploded: bool = False,
 ) -> dict:
     """Add a model view (e.g. an isometric view) to the active drawing.
     position is the view centre on the sheet in mm (default a free spot
     beside the other views); scale like "1:2" (default the sheet scale). The
-    model is the one the drawing already shows unless model_path is given."""
+    model is the one the drawing already shows unless model_path is given.
+    exploded=true shows an assembly's exploded view (see exploded_view)."""
     drw = sw.active_doc(DOC_DRAWING)
     if not model_path:
         views = _drawing_views(drw)
@@ -1418,6 +1421,8 @@ def drawing_view(
         raise RuntimeError(f"Could not create the {orientation} view of {model_path}")
     if scale:
         _set_view_scale(view, scale)
+    if exploded:
+        sw.invoke(view, "ShowExploded", True)
     drw.ForceRebuild3(False)
     if not position:  # now that its size is known
         x1, y1, x2, y2 = sw.m0(view, "GetOutline")
@@ -1569,6 +1574,37 @@ def center_marks(view: str = "", holes: bool = True, fillets: bool = False, slot
     return {"center_marks": done}
 
 
+def _table_boxes(drw: Any) -> list[tuple[float, float, float, float]]:
+    """Sheet boxes (m) of the tables on the current sheet."""
+    out = []
+    ta = sw.m0(sw.m0(drw, "GetFirstView"), "GetFirstTableAnnotation")
+    while ta is not None:
+        try:
+            out.append(_table_box(ta))
+        except Exception:
+            pass  # a table we cannot measure is not an obstacle we can avoid
+        ta = sw.m0(ta, "GetNext")
+    return out
+
+
+def _table_box(table: Any) -> tuple[float, float, float, float]:
+    w = sum(table.GetColumnWidth(i) for i in range(sw.m0(table, "ColumnCount")))
+    h = sum(table.GetRowHeight(i) for i in range(sw.m0(table, "RowCount")))
+    x, y = list(sw.m0(sw.m0(table, "GetAnnotation"), "GetPosition"))[:2]  # top left with a top-left anchor
+    return (x, y - h, x + w, y)
+
+
+def _place_table(drw: Any, table: Any, others: list) -> list[float]:
+    """Move a table (anchored top left) to a free spot near the sheet's top
+    right, clear of views and other tables; returns its top left (mm)."""
+    x1, y1, x2, y2 = _table_box(table)
+    w, h = x2 - x1, y2 - y1
+    sheet_w, sheet_h = _sheet_size(drw)
+    cx, cy = _free_spot(drw, w, h, near=(sheet_w, sheet_h), extra=others, margin=0.015)
+    sw.m0(table, "GetAnnotation").SetPosition2(cx - w / 2, cy + h / 2, 0)
+    return [round((cx - w / 2) / MM, 1), round((cy + h / 2) / MM, 1)]
+
+
 def _bom_template() -> str:
     """The standard BOM template of the installed SOLIDWORKS."""
     exe = str(sw.invoke(sw.app(), "GetExecutablePath"))
@@ -1591,27 +1627,29 @@ def bom_table(
     template: str = "",
 ) -> dict:
     """Insert a bill of materials table for the assembly in a drawing view
-    (default the first) with its top right corner at position [x,y] mm
-    (default the sheet's top right). template is a .sldbomtbt file, default
-    the standard template SOLIDWORKS ships."""
+    (default the first) with its top left corner at position [x,y] mm
+    (default a free spot near the sheet's top right). template is a
+    .sldbomtbt file, default the standard template SOLIDWORKS ships."""
     drw = sw.active_doc(DOC_DRAWING)
     target = _drawing_view(drw, view)
     sheet_w, sheet_h = _sheet_size(drw)
-    x, y = (mm(position[0]), mm(position[1])) if position else (sheet_w - 0.01, sheet_h - 0.01)
+    x, y = (mm(position[0]), mm(position[1])) if position else (0.02, sheet_h - 0.02)
     bom_type = {"top_level": 2, "parts_only": 1, "indented": 3}[kind]  # swBomType_e
     template = template or _bom_template()
+    others = _table_boxes(drw)
     drw.ActivateView(target.Name)
-    # anchored at the top right corner (swBOMConfigurationAnchor_TopRight)
+    # anchored at the top left corner (swBOMConfigurationAnchor_TopLeft)
     config = target.ReferencedConfiguration  # an empty name gives a table without rows
-    table = target.InsertBomTable4(False, x, y, 2, bom_type, config, template, False, 0, False)
+    table = target.InsertBomTable4(False, x, y, 1, bom_type, config, template, False, 0, False)
     if table is None:
         raise RuntimeError(f"Could not insert a BOM table (template {template}); does the view show an assembly?")
+    corner = [x / MM, y / MM] if position else _place_table(drw, table, others)
     drw.ForceRebuild3(False)
     try:
         rows = sw.m0(table, "RowCount") - 1  # without the header
     except Exception:
         rows = None
-    return {"rows": rows, "configuration": config, "template": template}
+    return {"rows": rows, "configuration": config, "top_left_mm": corner, "template": template}
 
 
 @tool
@@ -1639,6 +1677,237 @@ def _note_count(view: Any) -> int:
         n += 1
         note = sw.m0(note, "GetNext")
     return n
+
+
+def _view_pick(drw: Any, view: Any, ent: Any, mark: int, append: bool) -> bool:
+    """Select a model entity shown in a drawing view, with a mark."""
+    data = sw.m0(drw.SelectionManager, "CreateSelectData")
+    data.Mark = mark
+    data.View = view
+    return bool(ent.Select4(append, data))
+
+
+@tool
+def hole_table(
+    view: str = "",
+    origin_point: list[float] | None = None,
+    face_point: list[float] | None = None,
+    position: list[float] | None = None,
+    tags: Literal["letters", "numbers"] = "letters",
+) -> dict:
+    """Hole table (tag, X/Y position, size of every hole) for the holes of
+    a face in a drawing view (default the first view that shows holes face
+    on). origin_point is the model vertex ([x,y,z] mm) the X/Y positions
+    are measured from, default the view's lower left corner; face_point a
+    point on the face with the holes, default the face with most holes.
+    position is the table's top left corner on the sheet (mm), default a
+    free spot near the sheet's top right."""
+    drw = sw.active_doc(DOC_DRAWING)
+    views = [_drawing_view(drw, view)] if view else _drawing_views(drw)
+    vk, fk = sw.constant("swViewEntityType_Vertex"), sw.constant("swViewEntityType_Face")
+    target = face = None
+    for v in views:
+        faces = list(v.GetVisibleEntities2(sw.nothing(), fk) or ())
+        if face_point:
+            p = tuple(mm(c) for c in face_point)
+            near = [(math.dist(p, tuple(f.GetClosestPointOn(*p)[:3])), f) for f in faces]
+            near = [n for n in near if n[0] <= sw.TOLERANCE]
+            cand = min(near, key=lambda n: n[0])[1] if near else None
+        else:  # the face with most loops: an outline plus a loop per hole
+            cand = max(faces, key=lambda f: sw.m0(f, "GetLoopCount"), default=None)
+            cand = cand if cand is not None and sw.m0(cand, "GetLoopCount") > 1 else None
+        if cand is not None:
+            target, face = v, cand
+            break
+    if target is None:
+        raise LookupError("No view shows a face with holes" + (f" at {face_point} mm" if face_point else ""))
+    vertices = list(target.GetVisibleEntities2(sw.nothing(), vk) or ())
+    if origin_point:
+        p = tuple(mm(c) for c in origin_point)
+        origin = min(vertices, key=lambda vx: math.dist(p, tuple(sw.m0(vx, "GetPoint"))), default=None)
+    else:  # lower left on the sheet
+        def sheet_xy(vx):
+            x, y = _to_sheet(target, [c / MM for c in sw.m0(vx, "GetPoint")])
+            return x + y
+        origin = min(vertices, key=sheet_xy, default=None)
+    if origin is None:
+        raise LookupError(f"No vertex in {target.Name} to measure from")
+    drw.ActivateView(target.Name)
+    drw.ClearSelection2(True)
+    _view_pick(drw, target, origin, 1, False)  # origin with mark 1, faces with mark 2
+    _view_pick(drw, target, face, 2, True)
+    sheet_w, sheet_h = _sheet_size(drw)
+    x, y = (mm(position[0]), mm(position[1])) if position else (0.02, sheet_h - 0.02)
+    template = _table_template(f"standard hole table--{tags}.sldholtbt")
+    others = _table_boxes(drw)
+    table = target.InsertHoleTable2(False, x, y, 1, "A" if tags == "letters" else "1", template)  # anchored top left
+    drw.ClearSelection2(True)
+    if table is None:
+        raise RuntimeError("SOLIDWORKS did not create the hole table")
+    corner = [x / MM, y / MM] if position else _place_table(drw, table, others)
+    drw.ForceRebuild3(False)
+    try:
+        rows = sw.m0(table, "RowCount") - 1
+    except Exception:
+        rows = None
+    return {"view": target.Name, "holes": rows, "top_left_mm": corner, "template": template}
+
+
+def _table_template(name: str) -> str:
+    exe = str(sw.invoke(sw.app(), "GetExecutablePath"))
+    root = Path(os.path.dirname(exe) if exe.lower().endswith(".exe") else exe)
+    for lang in ("korean", "english"):
+        p = root / "lang" / lang / name
+        if p.exists():
+            return str(p)
+    found = sorted(root.glob(f"lang/*/{name}"))
+    if found:
+        return str(found[0])
+    raise FileNotFoundError(f"No {name} in the SOLIDWORKS installation")
+
+
+def _sheet_format_path(name: str) -> str:
+    if name.lower().endswith(".slddrt") and Path(name).exists():
+        return name
+    stem = name[:-7] if name.lower().endswith(".slddrt") else name
+    roots = [Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "SOLIDWORKS"]
+    exe = str(sw.invoke(sw.app(), "GetExecutablePath"))
+    roots.append(Path(os.path.dirname(exe) if exe.lower().endswith(".exe") else exe))
+    for root in roots:
+        for lang in ("korean", "english"):
+            for p in root.glob(f"*/lang/{lang}/sheetformat/{stem}.slddrt"):
+                return str(p)
+            p = root / "lang" / lang / "sheetformat" / f"{stem}.slddrt"
+            if p.exists():
+                return str(p)
+    raise FileNotFoundError(f"No sheet format {name!r}; try e.g. \"a3 - iso\" or \"a4 - iso\"")
+
+
+PROPERTY_LINK = re.compile(r'\$PRP(SHEET)?:"([^"]+)"', re.IGNORECASE)
+
+
+def _title_block_fields(drw: Any) -> dict[str, str]:
+    """Property names the sheet format's notes show: {name: "drawing" for
+    $PRP, "model" for $PRPSHEET}."""
+    fields: dict[str, str] = {}
+    sw.m0(drw, "EditTemplate")  # the sheet format's notes are only reachable while editing it
+    try:
+        note = sw.m0(sw.m0(drw, "GetFirstView"), "GetFirstNote")
+        while note is not None:
+            try:
+                text = sw.m0(note, "PropertyLinkedText") or ""
+            except Exception:
+                text = ""
+            for sheet, prop in PROPERTY_LINK.findall(text):
+                fields.setdefault(prop, "model" if sheet else "drawing")
+            note = sw.m0(note, "GetNext")
+    finally:
+        sw.m0(drw, "EditSheet")
+    return fields
+
+
+@tool
+def title_block(fields: dict[str, str] | None = None, sheet_format: str = "") -> dict:
+    """Fill in the drawing's title block. sheet_format first replaces the
+    current sheet's format, e.g. "a3 - iso" or "a4 - iso" (the standard
+    formats with a title block) or a .slddrt path. fields sets the
+    properties the title block shows ({"Description": "브래킷",
+    "DrawnBy": "..."}): those linked with $PRPSHEET go to the model, the
+    rest to the drawing. Returns the title block's fields and their values."""
+    drw = sw.active_doc(DOC_DRAWING)
+    sheet = sw.m0(drw, "GetCurrentSheet")
+    if sheet_format:
+        path = _sheet_format_path(sheet_format)
+        paper, _, s1, s2, first_angle, w, h = list(sw.m0(sheet, "GetProperties2"))[:7]
+        ok = drw.SetupSheet5(sw.m0(sheet, "GetName"), int(paper), 12, s1, s2, bool(first_angle), path, w, h, "Default", True)
+        if not ok:
+            raise RuntimeError(f"Could not apply the sheet format {path}")
+        drw.ForceRebuild3(False)
+    linked = _title_block_fields(drw)
+    views = _drawing_views(drw)
+    model = None
+    if views:
+        model_path = os.path.normcase(sw.m0(views[0], "GetReferencedModelName") or "")
+        model = next((d for d in sw.m0(sw.app(), "GetDocuments") or ()
+                      if os.path.normcase(sw.m0(d, "GetPathName") or "") == model_path), None)
+    managers = {"drawing": drw.Extension.CustomPropertyManager("")}
+    if model is not None:
+        managers["model"] = model.Extension.CustomPropertyManager("")
+    for name, value in (fields or {}).items():
+        where = linked.get(name, "drawing")
+        cpm = managers.get(where, managers["drawing"])
+        cpm.Add3(name, 30, str(value), 2)  # text, replace
+    drw.ForceRebuild3(False)
+    out = {}
+    for name, where in linked.items():
+        cpm = managers.get(where)
+        out[name] = {"from": where, "value": cpm.Get(name) if cpm is not None else None}
+    result = {"sheet_format": sw.m0(sheet, "GetTemplateName"), "fields": out}
+    unknown = [n for n in (fields or {}) if n not in linked]
+    if unknown:
+        result["not_in_title_block"] = unknown  # set on the drawing, but nothing shows them
+    return result
+
+
+TOLERANCE_TYPES = {"none": 0, "basic": 1, "bilateral": 2, "limit": 3, "symmetric": 4, "min": 5, "max": 6,
+                   "fit": 7, "fit_with_tolerance": 8, "fit_only": 9}  # swTolType_e
+
+
+def _find_dimension(doc: Any, name: str) -> Any:
+    """A dimension by name: "D1@스케치1" in a part/assembly, or as list_dimensions
+    shows it in a drawing (model dimensions and the drawing's own)."""
+    if sw.m0(doc, "GetType") != DOC_DRAWING:
+        dim = doc.Parameter(name)
+        if dim is None:
+            raise LookupError(f"No dimension {name!r}; see list_dimensions")
+        return dim
+    for view in [sw.m0(doc, "GetFirstView")] + _drawing_views(doc):
+        dd = sw.m0(view, "GetFirstDisplayDimension5")
+        while dd is not None:
+            dim = dd.GetDimension2(0)
+            full = dim.FullName
+            if name in (full, "@".join(full.split("@")[:2])):
+                return dim
+            dd = sw.m0(dd, "GetNext5")
+    raise LookupError(f"No dimension {name!r} in the drawing; see list_dimensions")
+
+
+@tool
+def set_tolerance(
+    dimension: str,
+    kind: Literal["none", "basic", "bilateral", "limit", "symmetric", "min", "max", "fit", "fit_with_tolerance", "fit_only"],
+    upper: float = 0.0,
+    lower: float = 0.0,
+    hole_fit: str = "",
+    shaft_fit: str = "",
+) -> dict:
+    """Tolerance of a dimension (name from list_dimensions, e.g. "D1@스케치1";
+    in a drawing as listed there). symmetric uses upper (±); bilateral and
+    limit use upper and lower deviations in mm (e.g. upper=0.1, lower=-0.05);
+    fit uses ISO fit classes, hole_fit like "H7" and/or shaft_fit like "g6".
+    Model dimensions keep it in every drawing that shows them."""
+    doc = sw.active_doc()
+    dim = _find_dimension(doc, dimension)
+    tol = sw.m0(dim, "Tolerance")
+    tol.Type = TOLERANCE_TYPES[kind]
+    # SetValues2 (per configuration) returns False here; SetValues works
+    if kind == "symmetric":
+        tol.SetValues(-mm(abs(upper)), mm(abs(upper)))
+    elif kind in ("bilateral", "limit", "min", "max", "fit_with_tolerance"):
+        tol.SetValues(mm(lower), mm(upper))
+    if kind.startswith("fit"):
+        tol.SetFitValues(hole_fit, shaft_fit)
+    doc.ForceRebuild3(False)
+    sw.m0(doc, "GraphicsRedraw2")
+    out = {"dimension": dim.FullName, "value_mm": round(dim.Value, 4),
+           "tolerance": {v: k for k, v in TOLERANCE_TYPES.items()}.get(tol.Type, tol.Type)}
+    try:
+        out["upper_mm"], out["lower_mm"] = round(sw.m0(tol, "GetMaxValue") / MM, 4), round(sw.m0(tol, "GetMinValue") / MM, 4)
+    except Exception:
+        pass
+    if kind.startswith("fit"):
+        out["fit"] = [sw.m0(tol, "GetHoleFitValue"), sw.m0(tol, "GetShaftFitValue")]
+    return out
 
 
 # --- Patterns, reference geometry and other features ------------------------
@@ -1904,6 +2173,114 @@ def dome(face_point: list[float], height: float, reverse: bool = False) -> dict:
     doc.InsertDome(mm(height), reverse, False)
     feat = doc.FeatureByPositionReverse(0)
     return _feature_result(feat if feat.Name != before else None, "dome")
+
+
+@tool
+def sketch_from_face(face_point: list[float], offset: float = 0.0, plane: str = "",
+                     inner_loops: bool = True, both_directions: bool = False) -> dict:
+    """Sketch the outline of the face at face_point ([x,y,z] mm): offset 0
+    copies its edges (convert entities), otherwise they are offset by
+    `offset` mm (positive = outward, negative = inward). The sketch goes on
+    that face, or on `plane` ("front"/"top"/"right" or a plane name) when
+    given, projected onto it. inner_loops also takes the face's holes.
+    Extrude or cut the result like any sketch."""
+    doc = sw.active_doc(DOC_PART)
+    sw.close_open_sketch(doc)
+    doc.ClearSelection2(True)
+    if plane:
+        key = plane.lower()
+        _select_plane(doc, sw.standard_plane(doc, key) if key in sw.PLANE_NAMES else sw.feature(doc, plane))
+    else:
+        sw.select_at(doc, "FACE", face_point, False)
+    sm = doc.SketchManager
+    sm.InsertSketch(True)
+    if sm.ActiveSketch is None:
+        raise RuntimeError("SOLIDWORKS did not open a sketch there")
+    try:
+        doc.ClearSelection2(True)
+        # SketchUseEdge3's second argument takes the inner loops *instead of* the outer one
+        sw.select_at(doc, "FACE", face_point, False)
+        if not sm.SketchUseEdge3(False, False):
+            raise RuntimeError(f"Could not convert the edges of the face at {face_point} mm")
+        if inner_loops:
+            doc.ClearSelection2(True)
+            sw.select_at(doc, "FACE", face_point, False)
+            sm.SketchUseEdge3(False, True)  # False when the face has no holes
+        if offset:
+            converted = list(sw.m0(sm.ActiveSketch, "GetSketchSegments") or ())
+            doc.ClearSelection2(True)
+            for i, seg in enumerate(converted):
+                seg.Select4(i > 0, sw.nothing())
+            # positive offsets go outward from the closed loops
+            if not sm.SketchOffset2(mm(offset), both_directions, True, 0, False, True):
+                raise RuntimeError("SOLIDWORKS could not offset the outline by that distance")
+            doc.ClearSelection2(True)
+            for i, seg in enumerate(converted):  # keep only the offset copy
+                seg.Select4(i > 0, sw.nothing())
+            sw.m0(doc, "EditDelete")
+        count = len(sw.m0(sm.ActiveSketch, "GetSketchSegments") or ())
+    finally:
+        doc.ClearSelection2(True)
+        sm.InsertSketch(True)
+    feat = sw.last_feature_of_type(doc, "ProfileFeature")
+    return {"sketch": feat.Name, "segments": count, "offset_mm": offset}
+
+
+@tool
+def list_bodies() -> list[dict]:
+    """Solid bodies of the active part (several after extrude(merge=false),
+    split or mirror), with volume and bounding box, for combine_bodies."""
+    doc = sw.active_doc(DOC_PART)
+    out = []
+    for b in doc.GetBodies2(0, True) or ():
+        box = b.GetBodyBox()
+        props = b.GetMassProperties(1.0)  # density 1: [cx, cy, cz, volume, area, mass, ...]
+        out.append({
+            "name": b.Name,
+            "volume_mm3": round(props[3] / MM**3, 3) if props else None,
+            "box_mm": {"min": [round(v / MM, 3) for v in box[:3]], "max": [round(v / MM, 3) for v in box[3:]]},
+        })
+    return out
+
+
+def _body_at(doc: Any, point: list[float]) -> Any:
+    dist, face = sw.nearest(doc, "face", point)
+    if face is None or dist > sw.TOLERANCE:
+        raise LookupError(f"No body surface within 0.5 mm of {point} mm")
+    return sw.m0(face, "GetBody")
+
+
+@tool
+def combine_bodies(operation: Literal["add", "subtract", "common"], main_body_point: list[float],
+                   tool_body_points: list[list[float]]) -> dict:
+    """Combine solid bodies of a multibody part. Each body is picked by a
+    point on its surface ([x,y,z] mm). add merges them all; subtract removes
+    the tool bodies from the main body; common keeps only the overlap."""
+    import pythoncom
+    from win32com.client import VARIANT
+
+    doc = sw.active_doc(DOC_PART)
+    main = _body_at(doc, main_body_point)
+    tools = [_body_at(doc, p) for p in tool_body_points]
+    if any(t.Name == main.Name for t in tools):
+        raise ValueError("A tool body point picks the main body itself")
+    # swBodyOperationType_e (SWBODYADD/CUT/INTERSECT), not swCombineBodiesOperation_e
+    op = sw.constant({"add": "SWBODYADD", "subtract": "SWBODYCUT", "common": "SWBODYINTERSECT"}[operation])
+    before = len(doc.GetBodies2(0, True) or ())
+    doc.ClearSelection2(True)
+    def bodies(items):
+        return VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, items)
+
+    # subtract takes the main body apart; add and common want every body as a tool
+    attempts = [(main, tools)] if operation == "subtract" else [(sw.nothing(), [main] + tools), (main, tools)]
+    feat = None
+    for first, rest in attempts:
+        feat = doc.FeatureManager.InsertCombineFeature(op, first, bodies(rest))
+        if feat is not None:
+            break
+    result = _feature_result(feat, f"combine ({operation})")
+    result["bodies_before"], result["bodies_after"] = before, len(doc.GetBodies2(0, True) or ())
+    return result
 
 
 # --- Equations, global variables and configurations -------------------------
@@ -2807,6 +3184,110 @@ def edge_flange(edge_point: list[float], length: float, angle: float = 90.0, fli
     return result
 
 
+HEM_TYPES = {"open": 0, "closed": 1, "teardrop": 2, "rolled": 3, "double": 4}  # swHemType_e
+
+
+@tool
+def hem(edge_points: list[list[float]], kind: Literal["closed", "open", "teardrop", "rolled", "double"] = "closed",
+        length: float = 10.0, gap: float = 0.5, angle: float = 270.0, radius: float = 1.0,
+        outside: bool = False, reverse: bool = False) -> dict:
+    """Sheet metal hem (folded-back edge) on the edges through edge_points
+    ([[x,y,z], ...] mm). closed/open use length (mm) and, for open, gap;
+    teardrop and rolled use angle (deg) and radius (mm). outside puts the hem
+    outside the material line; reverse folds it the other way."""
+    doc = sw.active_doc(DOC_PART)
+    doc.ClearSelection2(True)
+    for i, p in enumerate(edge_points):
+        sw.select_at(doc, "EDGE", p, i > 0, 0)
+    feat = doc.FeatureManager.InsertSheetMetalHem2(
+        HEM_TYPES[kind], 1 if outside else 0, reverse, mm(length), mm(gap), deg(angle), mm(radius), 0,
+        sw.nothing(), True, 0, 0, True, 0.5, 0, 0)  # default relief
+    return _feature_result(feat, "hem")
+
+
+def _chain_end(edges: list) -> tuple[Any, Any]:
+    """(edge, vertex) at one free end of a chain of edges, where a miter
+    flange profile starts."""
+    def key(v):
+        return tuple(round(c, 7) for c in sw.m0(v, "GetPoint"))
+
+    count: dict = {}
+    for e in edges:
+        for v in (sw.m0(e, "GetStartVertex"), sw.m0(e, "GetEndVertex")):
+            count[key(v)] = count.get(key(v), 0) + 1
+    for e in edges:
+        for v in (sw.m0(e, "GetStartVertex"), sw.m0(e, "GetEndVertex")):
+            if count[key(v)] == 1:
+                return e, v
+    return edges[0], sw.m0(edges[0], "GetStartVertex")  # a closed loop: any vertex
+
+
+@tool
+def miter_flange(edge_points: list[list[float]], length: float, angle: float = 90.0, flip: bool = False) -> dict:
+    """Sheet metal miter flange: one flange running along a chain of
+    connected edges (through edge_points, [[x,y,z], ...] mm), mitred at the
+    corners. `length` mm, bent `angle` degrees (90 = perpendicular) towards
+    the outside of the face the edges lie on (flip for the other side)."""
+    doc = sw.active_doc(DOC_PART)
+    sel = doc.SelectionManager
+    edges = []
+    for p in edge_points:
+        doc.ClearSelection2(True)
+        sw.select_at(doc, "EDGE", p, False, 0)
+        edges.append(sel.GetSelectedObject6(1, -1))
+    edge, vertex = _chain_end(edges)
+    faces = sorted(sw.m0(edge, "GetTwoAdjacentFaces2") or (), key=lambda f: sw.m0(f, "GetArea"), reverse=True)
+    if len(faces) < 2:
+        raise ValueError("The edges are not sheet edges")
+    n, t = tuple(faces[0].Normal), tuple(faces[1].Normal)
+    sign, th = (-1 if flip else 1), deg(angle)
+    d = tuple(mm(length) * (sign * n[i] * math.sin(th) + t[i] * math.cos(th)) for i in range(3))
+    a = sw.m0(vertex, "GetPoint")
+
+    def pick(obj, mark, append):
+        data = sw.m0(sel, "CreateSelectData")
+        data.Mark = mark
+        obj.Select4(append, data)
+
+    # profile plane: normal to the end edge at the free vertex
+    doc.ClearSelection2(True)
+    pick(edge, 0, False)
+    pick(vertex, 1, True)
+    plane = doc.FeatureManager.InsertRefPlane(2, 0, 4, 0, 0, 0)  # perpendicular, coincident
+    if plane is None:
+        raise RuntimeError("Could not create the profile plane at the end of the edges")
+    doc.ClearSelection2(True)
+    _select_plane(doc, plane)
+    sm = doc.SketchManager
+    sm.InsertSketch(True)
+    if sm.ActiveSketch is None:
+        raise RuntimeError("Could not open the profile sketch")
+    p0, p1 = _transform_points(sw.m0(sm.ActiveSketch, "ModelToSketchTransform"), [a, tuple(a[i] + d[i] for i in range(3))])
+    sm.AddToDB = True
+    try:
+        sm.CreateLine(p0[0], p0[1], 0, p1[0], p1[1], 0)
+    finally:
+        sm.AddToDB = False
+        sm.InsertSketch(True)
+    profile = sw.last_feature_of_type(doc, "ProfileFeature")
+    # the profile sketch with mark 0, the edges with mark 1
+    doc.ClearSelection2(True)
+    profile.Select2(False, 0)
+    for e in edges:
+        pick(e, 1, True)
+    feat = doc.FeatureManager.InsertSheetMetalMiterFlange(
+        True, 0, mm(0.1), True, True, 0.5, 0, 0, 0, False, 1, 0, 0, sw.nothing())
+    doc.ClearSelection2(True)
+    if feat is None:
+        _delete_feature_obj(doc, profile)
+        _delete_feature_obj(doc, plane)
+        raise RuntimeError("SOLIDWORKS did not create the miter flange; are the edges connected?")
+    plane.Select2(False, 0)
+    sw.m0(doc, "BlankRefGeom")  # hide the helper plane
+    doc.ClearSelection2(True)
+    return _feature_result(feat, "miter flange") | {"profile_plane": plane.Name}
+
+
 # --- Assembly management ----------------------------------------------------
 
 MATE_TYPES = {0: "coincident", 1: "concentric", 2: "perpendicular", 3: "parallel", 4: "tangent", 5: "distance",
@@ -2899,6 +3380,128 @@ def set_component(
         "suppressed": bool(sw.m0(comp, "IsSuppressed")),
         "origin_mm": [round(v / MM, 3) for v in origin] if origin else None,
     }
+
+
+def _pick(doc: Any, obj: Any, mark: int, append: bool) -> bool:
+    data = sw.m0(doc.SelectionManager, "CreateSelectData")
+    data.Mark = mark
+    try:
+        return bool(obj.Select4(append, data, False))  # components take a third argument
+    except Exception:
+        return bool(obj.Select4(append, data))
+
+
+def _select_assembly_direction(asm: Any, direction: str, mark: int) -> None:
+    """A direction in an assembly: "x"/"y"/"z" (a reference axis through
+    the origin is created), an axis name, or "edge:x,y,z" (assembly mm)."""
+    if direction.startswith("edge:"):
+        sw.select_at(asm, "EDGE", [float(v) for v in direction[5:].split(",")], True, mark)
+    elif direction.lower() in ("x", "y", "z"):
+        axis = _axis(asm, direction.lower())
+        asm.ClearSelection2(True)
+        axis.Select2(True, mark)
+    else:
+        sw.select_feature(asm, direction, append=True, mark=mark)
+
+
+def _make_component_pattern(asm: Any, comps: list, count: int, spacing: float, direction: str,
+                            linear: bool, reverse: bool) -> tuple[Any, list]:
+    fm = asm.FeatureManager
+    # the definition first, then components (mark 1) and the direction (mark 2)
+    data = fm.CreateDefinition(sw.constant("swFmLocalLPattern" if linear else "swFmLocalCirPattern"))
+    asm.ClearSelection2(True)
+    for i, c in enumerate(comps):
+        _pick(asm, c, 1, i > 0)
+    _select_assembly_direction(asm, direction, 2)
+    if linear:
+        data.D1Spacing = mm(spacing)
+        data.D1TotalInstances = count
+        data.D1ReverseDirection = reverse
+    else:
+        data.Spacing = deg(spacing)
+        data.TotalInstances = count
+        data.ReverseDirection = reverse
+    before = {c.Name2 for c in asm.GetComponents(False) or ()}
+    feat = fm.CreateFeature(data)
+    asm.ClearSelection2(True)
+    return feat, [c for c in asm.GetComponents(False) or () if c.Name2 not in before]
+
+
+def _origin(comp: Any) -> list[float]:
+    return list(sw.m0(comp.Transform2, "ArrayData"))[9:12]
+
+
+@tool
+def component_pattern(
+    components: list[str],
+    count: int,
+    spacing: float,
+    direction: str = "x",
+    kind: Literal["linear", "circular"] = "linear",
+    reverse: bool = False,
+) -> dict:
+    """Pattern assembly components (names as in list_components). linear:
+    `count` copies (including the original) `spacing` mm apart along
+    direction ("x"/"y"/"z" = the positive assembly axis, an axis name or
+    "edge:x,y,z" in assembly mm); reverse goes the other way. circular:
+    around that axis, `spacing` is the angle in degrees between copies
+    (360/count spreads them evenly)."""
+    asm = sw.active_doc(DOC_ASSEMBLY)
+    comps = [_component(asm, n) for n in components]
+    linear = kind == "linear"
+    axis = "xyz".find(direction.lower()) if direction.lower() in ("x", "y", "z") else -1
+    if axis >= 0:  # creating the axis clears the selection, so before picking
+        direction = _axis(asm, direction.lower()).Name
+    feat, added = _make_component_pattern(asm, comps, count, spacing, direction, linear, reverse)
+    if feat is not None and linear and axis >= 0 and added:
+        # a reference axis may point either way: make "x" mean +x
+        seed = _origin(comps[0])[axis]
+        nearest = min(added, key=lambda c: abs(_origin(c)[axis] - seed))
+        if (_origin(nearest)[axis] < seed) != reverse:
+            _delete_feature_obj(asm, feat)
+            feat, added = _make_component_pattern(asm, comps, count, spacing, direction, linear, not reverse)
+    result = _feature_result(feat, f"{kind} component pattern")
+    result["components_added"] = len(added)
+    return result
+
+
+AXIS_INDEX = {"x": 0, "y": 1, "z": 2}  # swExplodeDirectionIndex_e
+
+
+@tool
+def exploded_view(steps: list[dict], show: bool = True) -> dict:
+    """Exploded view of the active assembly. steps is a list of
+    {"components": ["name-1", ...], "direction": "x"|"y"|"z", "distance": mm}
+    (negative distance = the other way), applied in order. Adds to the
+    configuration's exploded view, creating one if needed; show=false
+    collapses it again afterwards. Drawing views can show it with
+    drawing_view(exploded=true)."""
+    asm = sw.active_doc(DOC_ASSEMBLY)
+    cfg = sw.m0(asm, "GetActiveConfiguration")
+    if not (sw.m0(asm, "GetExplodedViewNames") or ()):
+        sw.m0(asm, "CreateExplodedView")
+        # it starts with an automatic step that spreads every component: drop it
+        for i in reversed(range(sw.m0(cfg, "GetNumberOfExplodeSteps") or 0)):
+            cfg.DeleteExplodeStep(sw.m0(cfg.GetExplodeStep(i), "Name"))
+    names = list(sw.m0(asm, "GetExplodedViewNames") or ())
+    made = []
+    for i, step in enumerate(steps):
+        comps = [_component(asm, n) for n in step["components"]]
+        asm.ClearSelection2(True)
+        for j, c in enumerate(comps):
+            _pick(asm, c, 1, j > 0)  # components with mark 1
+        dist = float(step["distance"])
+        err = sw.out_int()
+        added = cfg.AddExplodeStep2(mm(abs(dist)), AXIS_INDEX[step.get("direction", "y").lower()], dist < 0,
+                                    0, -1, False, False, False, err)
+        if added is None:
+            raise RuntimeError(f"Step {i + 1} was not added (swAddExplodeStepError {err.value})")
+        made.append(sw.m0(added, "Name") if hasattr(added, "Name") else f"step {i + 1}")
+    asm.ClearSelection2(True)
+    sw.invoke(asm, "ShowExploded2", show, names[0] if names else "")
+    sw.m0(asm, "GraphicsRedraw2")
+    return {"exploded_view": names[0] if names else None, "steps_added": made,
+            "total_steps": sw.m0(cfg, "GetNumberOfExplodeSteps"), "shown": show}
 
 
 # --- Escape hatches -------------------------------------------------------
