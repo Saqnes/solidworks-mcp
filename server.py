@@ -1053,6 +1053,9 @@ def add_mate(
 # --- Drawings -------------------------------------------------------------
 
 
+CALLOUT_PITCH = 0.024  # m on the sheet between stacked hole callouts
+
+
 def _hole_callouts(drw: Any) -> dict:
     """Add one hole callout per Hole Wizard feature, on a view where its
     holes appear as circles; SOLIDWORKS adds the instance count ("2X")."""
@@ -1077,10 +1080,12 @@ def _hole_callouts(drw: Any) -> dict:
                 drw.ClearSelection2(True)
                 if not view.SelectEntity(edge, False):
                     continue
-                # stack the callout texts beside the view's right edge
+                # stack the callout texts beside the view's right edge, one
+                # slot per callout tall enough for three lines (hole, seat
+                # or thread, countersink)
                 outline = sw.m0(view, "GetOutline")  # xmin, ymin, xmax, ymax on the sheet (m)
                 x = outline[2] + 0.015
-                y = outline[3] - 0.012 * stack
+                y = outline[3] - CALLOUT_PITCH * stack
                 if drw.AddHoleCallout2(x, y, 0) is not None:
                     done[feat.Name] = view.Name
                     stack += 1
@@ -1094,11 +1099,15 @@ def _hole_callouts(drw: Any) -> dict:
     return out
 
 
-def _annotation_types() -> int:
-    """Marked-for-drawing dimensions plus Hole Wizard locations, looked up in
-    swconst where available (32768 = swInsertDimensionsMarkedForDrawing)."""
+def _annotation_types(marked_only: bool = True) -> int:
+    """Marked-for-drawing dimensions (plus the unmarked ones unless
+    marked_only) and Hole Wizard locations, looked up in swconst where
+    available (32768 = swInsertDimensionsMarkedForDrawing)."""
     types = 32768
-    for name in ("swInsertDimensionsMarkedForDrawing", "swInsertHoleWizardLocations"):
+    names = ["swInsertDimensionsMarkedForDrawing", "swInsertHoleWizardLocations"]
+    if not marked_only:
+        names.append("swInsertDimensionsNotMarkedForDrawing")
+    for name in names:
         try:
             types |= sw.constant(name)
         except Exception:
@@ -1107,23 +1116,40 @@ def _annotation_types() -> int:
 
 
 def _import_model_dimensions(drw: Any) -> dict:
-    """Import model dimensions into all views and report how many arrived;
-    if none did, retry view by view before warning."""
-    def run(all_views: bool) -> int:
-        made = drw.InsertModelAnnotations3(0, _annotation_types(), all_views, True, False, False)
+    """Import model dimensions into all views and report how many arrived.
+    Dimensions marked for drawing come first; if there are none (parts built
+    through the API often have no marks), all dimensions are imported, and
+    as a last resort view by view, before warning."""
+    def run(all_views: bool, marked_only: bool) -> int:
+        made = drw.InsertModelAnnotations3(0, _annotation_types(marked_only), all_views, True, False, False)
         return len(made) if made else 0
 
-    count = run(True)
+    # Right after the views are created the call imports nothing, even after
+    # a rebuild: the views' geometry is only computed once something asks
+    # for it, such as a PDF export or listing a view's visible edges.
+    edge_kind = sw.constant("swViewEntityType_Edge")
+    view = sw.m0(drw, "GetFirstView")
+    view = sw.m0(view, "GetNextView") if view is not None else None  # skip the sheet
+    while view is not None:
+        view.GetVisibleEntities2(sw.nothing(), edge_kind)
+        view = sw.m0(view, "GetNextView")
+    source = "marked for drawing"
+    count = run(True, True)
+    if count == 0:
+        source = "all model dimensions"
+        count = run(True, False)
     if count == 0:
         view = sw.m0(drw, "GetFirstView")
         view = sw.m0(view, "GetNextView") if view is not None else None  # skip the sheet
         while view is not None:
             drw.ActivateView(view.Name)
-            count += run(False)
+            count += run(False, False)
             view = sw.m0(view, "GetNextView")
     out: dict = {"dimensions_imported": count}
-    if count == 0:
-        out["dimension_warning"] = "No model dimensions were imported; check that the model's dimensions are marked for drawing"
+    if count:
+        out["dimension_source"] = source
+    else:
+        out["dimension_warning"] = "No model dimensions were imported, marked for drawing or not"
     return out
 
 
@@ -1659,29 +1685,42 @@ def _wizard_args(kind: str, size: str, through: bool, depth: float, cosmetic: bo
     return (generic, 8, fastener, size, end_type, mm(TAP_DRILL[size]), blind, True) + values + tail
 
 
-def _clearance_variants(size: str, through: bool, depth: float) -> list[tuple[str, tuple]]:
+def _no_countersink_variants(kind: str, size: str, recorded: tuple) -> list[tuple[str, tuple]]:
     """Argument sets that may switch off the near-side countersink SOLIDWORKS
-    adds to clearance holes by default; which one works is not documented,
-    so each is tried and checked on the geometry (no conical face)."""
-    generic, fastener = WIZARD_TYPES["clearance"]
-    drill = mm(CLEARANCE[size])
-    head = (generic, 8, fastener, size, 1 if through else 0, drill, mm(depth) if not through else 0.01, -1)
-    tail = ("", False, True, True, True, True, False)
-    rest = (0, 0, 0, -1, -1, -1, -1, -1)
-    return [
-        ("countersink diameter 0", head + (1, 0, 0, HALF_PI) + rest + tail),
-        ("countersink flag off", head + (0, 0, 0, HALF_PI) + rest + tail),
-        ("countersink = drill", head + (1, 0, drill, HALF_PI) + rest + tail),
-    ]
+    adds by default to clearance, tapped and counterbore holes. Which one
+    works is not documented, so each is tried and checked on the geometry
+    (no conical face at the hole entry). Keys are HoleWizard5 argument
+    indexes; the values start at index 8 (V1)."""
+    if kind == "clearance":  # V1 fit, V3/V4 countersink diameter/angle
+        drill = mm(CLEARANCE[size])
+        changes = [("countersink diameter 0", {10: 0}), ("countersink flag off", {8: 0, 10: 0}),
+                   ("countersink = drill", {10: drill})]
+    elif kind == "tapped":  # V2/V3 countersink diameter/angle
+        changes = [("countersink diameter 0", {9: 0}), ("countersink diameter and angle 0", {9: 0, 10: 0}),
+                   ("countersink = tap drill", {9: mm(TAP_DRILL[size])})]
+    elif kind == "counterbore":  # V4 flag?, V6/V7 countersink diameter/angle on the bore
+        changes = [("countersink diameter 0", {13: 0}), ("countersink flag off", {11: 0, 13: 0}),
+                   ("countersink = bore", {13: mm(COUNTERBORE[size][0])})]
+    else:
+        return []
+    return [(label, tuple(new.get(i, v) for i, v in enumerate(recorded))) for label, new in changes]
 
 
-def _has_cone(feat: Any) -> bool:
+def _has_entry_cone(feat: Any, entry: tuple, normal: tuple) -> bool:
+    """Whether the hole has a conical face reaching the entry face (a
+    near-side countersink); a blind hole's drill point lies deeper down."""
+    level = sum(entry[i] * normal[i] for i in range(3))
     for face in sw.m0(feat, "GetFaces") or ():
         try:
-            if sw.invoke(sw.m0(face, "GetSurface"), "IsCone"):
-                return True
+            if not sw.invoke(sw.m0(face, "GetSurface"), "IsCone"):
+                continue
+            box = sw.m0(face, "GetBox")  # x1, y1, z1, x2, y2, z2 (m)
         except Exception:
             continue  # a face whose surface type cannot be read is not a countersink we can see
+        corners = [(box[0 + 3 * a], box[1 + 3 * b], box[2 + 3 * c]) for a in (0, 1) for b in (0, 1) for c in (0, 1)]
+        top = max(sum(pt[i] * normal[i] for i in range(3)) for pt in corners)
+        if top > level - 0.05 * MM:
+            return True
     return False
 
 
@@ -1691,9 +1730,10 @@ def _delete_feature_obj(doc: Any, feat: Any) -> None:
     doc.Extension.DeleteSelection2(1)
 
 
-def _select_face_by_ray(doc: Any, face_point: list[float]) -> None:
+def _select_face_by_ray(doc: Any, face_point: list[float]) -> tuple:
     """Select the face at face_point the way the Hole Wizard recording does:
-    a ray shot onto it from just outside, which also sets the pick point."""
+    a ray shot onto it from just outside, which also sets the pick point.
+    Returns the face's outward normal."""
     dist, face = sw.nearest(doc, "face", face_point)
     if face is None or dist > sw.TOLERANCE:
         raise LookupError(f"No face within 0.5 mm of {face_point} mm")
@@ -1703,24 +1743,27 @@ def _select_face_by_ray(doc: Any, face_point: list[float]) -> None:
     doc.ClearSelection2(True)
     if not doc.Extension.SelectByRay(*start, -n[0], -n[1], -n[2], 0.0002, 2, False, 0, 0):  # 2 = faces
         raise RuntimeError(f"Could not pick the face at {face_point} mm")
+    return n
 
 
 def _hole_wizard(doc: Any, kind: str, size: str, positions: list[list[float]], face_point: list[float],
                  depth: float, cosmetic: bool, thread_depth: float, near_csk: bool = True) -> dict:
     recorded = _wizard_args(kind, size, depth <= 0, depth, cosmetic, thread_depth)
     attempts = [("as recorded", recorded)]
-    if kind == "clearance" and not near_csk:
-        attempts = _clearance_variants(size, depth <= 0, depth) + attempts
+    switch_off = not near_csk and kind != "countersink"
+    if switch_off:
+        attempts = _no_countersink_variants(kind, size, recorded) + attempts
+    entry = tuple(mm(v) for v in face_point)
     feat, variant = None, None
     for label, args in attempts:
-        _select_face_by_ray(doc, face_point)
+        normal = _select_face_by_ray(doc, face_point)
         try:
             candidate = doc.FeatureManager.HoleWizard5(*args)
         except Exception:
             continue
         if candidate is None:
             continue
-        if kind == "clearance" and not near_csk and label != "as recorded" and _has_cone(candidate):
+        if switch_off and label != "as recorded" and _has_entry_cone(candidate, entry, normal):
             _delete_feature_obj(doc, candidate)  # this variant kept the countersink
             continue
         feat, variant = candidate, label
@@ -1760,7 +1803,7 @@ def _hole_wizard(doc: Any, kind: str, size: str, positions: list[list[float]], f
         doc.Extension.DeleteSelection2(1)  # don't leave a half-placed wizard hole behind
         raise
     result = {"features": [feat.Name], "method": "hole_wizard"}
-    if kind == "clearance":
+    if kind != "countersink":
         result["near_side_countersink"] = near_csk or variant == "as recorded"
         if not near_csk:
             result["countersink_off_by"] = variant if variant != "as recorded" else "none worked; SOLIDWORKS default kept"
@@ -1789,8 +1832,9 @@ def hole(
     By default this is a real Hole Wizard hole, so drawings get hole
     callouts; tapped holes get a cosmetic thread (cosmetic_thread=false for
     the tap drill only) and, when blind, a thread depth (default 75 % of the
-    depth). Clearance holes come without SOLIDWORKS' default near-side
-    countersink unless near_side_countersink=true. If the wizard fails, or
+    depth). Clearance, tapped and counterbore holes come without
+    SOLIDWORKS' default near-side countersink unless
+    near_side_countersink=true. If the wizard fails, or
     without face_point, or with
     wizard=false, the holes are sketched and cut instead (no callouts);
     "method" in the result says which happened."""
