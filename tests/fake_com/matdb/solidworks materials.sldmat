@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mstns:materials xmlns:mstns="http://www.solidworks.com/sldmaterials">
+ <classification name="Aluminium Alloys">
+  <material name="6061 Alloy"/><material name="6061-T6 (SS)"/><material name="7075-T6 (SN)"/>
+ </classification>
+ <classification name="Steel"><material name="AISI 304"/></classification>
+</mstns:materials>
