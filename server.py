@@ -110,11 +110,20 @@ def open_document(path: str) -> dict:
     ext = Path(path).suffix.lower()
     if ext not in sw.DOC_TYPES:
         raise ValueError("Only .sldprt, .sldasm and .slddrw can be opened; use run_api_script (LoadFile4) to import STEP etc.")
+    app = sw.app()
+    target = os.path.normcase(os.path.abspath(str(Path(path))))
+    for d in sw.m0(app, "GetDocuments") or ():
+        p = sw.m0(d, "GetPathName")
+        if p and os.path.normcase(os.path.abspath(p)) == target:
+            # Already open: OpenDoc6 would return it without switching windows.
+            active = app.ActivateDoc3(sw.m0(d, "GetTitle"), False, 0, sw.out_int())
+            return {**sw.doc_info(active or d), "already_open": True}
     errors, warnings = sw.out_int(), sw.out_int()
-    doc = sw.app().OpenDoc6(str(Path(path)), sw.DOC_TYPES[ext], 1, "", errors, warnings)  # 1 = silent
+    doc = app.OpenDoc6(str(Path(path)), sw.DOC_TYPES[ext], 1, "", errors, warnings)  # 1 = silent
     if doc is None:
         raise RuntimeError(f"Open failed (swFileLoadError {errors.value}) for {path}")
-    return {**sw.doc_info(doc), "warnings": warnings.value}
+    active = app.ActivateDoc3(sw.m0(doc, "GetTitle"), False, 0, sw.out_int())
+    return {**sw.doc_info(active or doc), "warnings": warnings.value}
 
 
 @tool
@@ -1069,7 +1078,7 @@ def _hole_callouts(drw: Any) -> dict:
                 if not view.SelectEntity(edge, False):
                     continue
                 # stack the callout texts beside the view's right edge
-                outline = view.GetOutline()  # xmin, ymin, xmax, ymax on the sheet (m)
+                outline = sw.m0(view, "GetOutline")  # xmin, ymin, xmax, ymax on the sheet (m)
                 x = outline[2] + 0.015
                 y = outline[3] - 0.012 * stack
                 if drw.AddHoleCallout2(x, y, 0) is not None:
@@ -1082,6 +1091,39 @@ def _hole_callouts(drw: Any) -> dict:
     out: dict = {"hole_callouts": done}
     if notes:
         out["callout_problems"] = notes[:5]
+    return out
+
+
+def _annotation_types() -> int:
+    """Marked-for-drawing dimensions plus Hole Wizard locations, looked up in
+    swconst where available (32768 = swInsertDimensionsMarkedForDrawing)."""
+    types = 32768
+    for name in ("swInsertDimensionsMarkedForDrawing", "swInsertHoleWizardLocations"):
+        try:
+            types |= sw.constant(name)
+        except Exception:
+            continue  # constant missing in this release: import what we can
+    return types
+
+
+def _import_model_dimensions(drw: Any) -> dict:
+    """Import model dimensions into all views and report how many arrived;
+    if none did, retry view by view before warning."""
+    def run(all_views: bool) -> int:
+        made = drw.InsertModelAnnotations3(0, _annotation_types(), all_views, True, False, False)
+        return len(made) if made else 0
+
+    count = run(True)
+    if count == 0:
+        view = sw.m0(drw, "GetFirstView")
+        view = sw.m0(view, "GetNextView") if view is not None else None  # skip the sheet
+        while view is not None:
+            drw.ActivateView(view.Name)
+            count += run(False)
+            view = sw.m0(view, "GetNextView")
+    out: dict = {"dimensions_imported": count}
+    if count == 0:
+        out["dimension_warning"] = "No model dimensions were imported; check that the model's dimensions are marked for drawing"
     return out
 
 
@@ -1119,10 +1161,9 @@ def make_drawing(
     create = drw.Create3rdAngleViews2 if projection == "third_angle" else drw.Create1stAngleViews2
     if not create(model_path):
         raise RuntimeError(f"Could not create views of {model_path}")
-    if import_dimensions:
-        # all views, marked-for-drawing dimensions, then rebuild
-        drw.InsertModelAnnotations3(0, 32768, True, True, False, False)
     info = sw.doc_info(drw)
+    if import_dimensions:
+        info.update(_import_model_dimensions(drw))
     if hole_callouts:
         try:
             info.update(_hole_callouts(drw))
