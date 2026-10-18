@@ -9,8 +9,8 @@ order, retries, error handling), not real geometry.
 .venv\Scripts\python -I tests\fake_com\run_all.py
 ```
 
-(On Linux: `python -I tests/fake_com/run_all.py` with `mcp`, `pillow`,
-`numpy`-free deps installed; pywin32 is not needed.)
+(Also runs on Linux or macOS with just `mcp` and `pillow` installed;
+pywin32 is not needed.)
 
 ## ERR lines that are expected
 
