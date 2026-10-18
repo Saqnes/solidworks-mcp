@@ -173,6 +173,66 @@ def put_indexed(obj: Any, name: str, index: Any, value: Any) -> None:
     obj._oleobj_.Invoke(dispid, 0, pythoncom.DISPATCH_PROPERTYPUT, False, index, value)
 
 
+# --- SOLIDWORKS constants (swconst.tlb) ---------------------------------------
+
+SWCONST_TYPELIB = "{4687F359-55D0-4CD3-B6CF-2EB42C11F989}"
+_constants: dict[str, int] | None = None
+
+
+def _swconst_paths() -> list[str]:
+    paths = []
+    try:
+        exe = invoke(app(), "GetExecutablePath")
+        folder = os.path.dirname(exe) if str(exe).lower().endswith(".exe") else str(exe)
+        paths.append(os.path.join(folder, "swconst.tlb"))
+    except Exception:
+        pass
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, rf"TypeLib\{SWCONST_TYPELIB}") as root:
+            versions = [winreg.EnumKey(root, i) for i in range(winreg.QueryInfoKey(root)[0])]
+            for ver in sorted(versions, key=lambda v: [int(x, 16) for x in v.split(".")], reverse=True):
+                for arch in ("win64", "win32"):
+                    try:
+                        paths.append(winreg.QueryValue(root, rf"{ver}\0\{arch}"))
+                    except OSError:
+                        continue
+    except OSError:
+        pass
+    paths.append(r"C:\Program Files\SOLIDWORKS Corp\SOLIDWORKS\swconst.tlb")
+    return paths
+
+
+def constant(name: str) -> int:
+    """Value of a SOLIDWORKS enum member (e.g. "swFmBaseFlange"), read from
+    the installed swconst type library instead of hard-coding numbers."""
+    global _constants
+    import pythoncom
+
+    if _constants is None:
+        table: dict[str, int] = {}
+        for path in _swconst_paths():
+            if not os.path.exists(path):
+                continue
+            tlb = pythoncom.LoadTypeLib(path)
+            for i in range(tlb.GetTypeInfoCount()):
+                ti = tlb.GetTypeInfo(i)
+                attr = ti.GetTypeAttr()
+                if attr.typekind != pythoncom.TKIND_ENUM:
+                    continue
+                for j in range(attr.cVars):
+                    vd = ti.GetVarDesc(j)
+                    table[ti.GetNames(vd.memid)[0]] = vd.value
+            break
+        if not table:
+            raise RuntimeError("Could not read swconst.tlb from the SOLIDWORKS installation")
+        _constants = table
+    if name not in _constants:
+        raise LookupError(f"SOLIDWORKS has no constant {name!r}")
+    return _constants[name]
+
+
 # --- Connection -----------------------------------------------------------
 
 _app: Any = None
@@ -314,6 +374,23 @@ def _nearest(entities: Any, point: tuple[float, float, float], where: Callable[[
 TOLERANCE = 0.5 * MM
 
 
+def nearest(doc: Any, entity: str, point_mm: list[float]) -> tuple[float, Any]:
+    """(distance m, entity) of the part's face/edge/vertex nearest a point (mm)."""
+    p = tuple(mm(v) for v in point_mm)
+    best: tuple[float, Any] = (math.inf, None)
+    for body in doc.GetBodies2(0, False) or ():
+        if entity == "edge":
+            cand = _nearest(m0(body, "GetEdges"), p, lambda e: e.GetClosestPointOn(*p))
+        elif entity == "face":
+            cand = _nearest(m0(body, "GetFaces"), p, lambda f: f.GetClosestPointOn(*p))
+        elif entity == "vertex":
+            cand = _nearest(m0(body, "GetVertices"), p, lambda v: m0(v, "GetPoint"))
+        else:
+            raise ValueError(f"Unknown entity type {entity!r}")
+        best = min(best, cand, key=lambda c: c[0])
+    return best
+
+
 def select_at(doc: Any, entity: str, point_mm: list[float], append: bool, mark: int = 0) -> None:
     """Select the face/edge/vertex nearest a model-space point (mm).
 
@@ -323,17 +400,7 @@ def select_at(doc: Any, entity: str, point_mm: list[float], append: bool, mark: 
     entity = entity.lower()
     p = tuple(mm(v) for v in point_mm)
     if m0(doc, "GetType") == DOC_PART:
-        best = (math.inf, None)
-        for body in doc.GetBodies2(0, False) or ():  # solid bodies, hidden ones included
-            if entity == "edge":
-                cand = _nearest(m0(body, "GetEdges"), p, lambda e: e.GetClosestPointOn(*p))
-            elif entity == "face":
-                cand = _nearest(m0(body, "GetFaces"), p, lambda f: f.GetClosestPointOn(*p))
-            elif entity == "vertex":
-                cand = _nearest(m0(body, "GetVertices"), p, lambda v: m0(v, "GetPoint"))
-            else:
-                raise ValueError(f"Unknown entity type {entity!r}")
-            best = min(best, cand, key=lambda c: c[0])
+        best = nearest(doc, entity, point_mm)  # solid bodies, hidden ones included
         if best[1] is not None and best[0] <= TOLERANCE:
             if not _select_entity(doc, best[1], append, mark):
                 raise RuntimeError(f"Found the {entity} at {point_mm} mm but could not select it")

@@ -1522,6 +1522,94 @@ def _rename(feat_name: str, new: str) -> str:
         return feat_name  # name taken or not allowed: keep SOLIDWORKS' name
 
 
+HALF_PI = math.pi / 2
+# HoleWizard5 GenericHoleType / FastenerTypeIndex with StandardIndex 8 (ISO),
+# from macros recorded in SOLIDWORKS 2025 (see docs/recordings/HANDOFF.md).
+WIZARD_TYPES = {"counterbore": (0, 139), "countersink": (1, 140), "clearance": (2, 144), "tapped": (4, 147)}
+
+
+def _wizard_args(kind: str, size: str, through: bool, depth: float, cosmetic: bool, thread_depth: float) -> tuple:
+    """The 27 HoleWizard5 arguments, following the recorded calls and
+    scaling the size-dependent values from the ISO tables."""
+    generic, fastener = WIZARD_TYPES[kind]
+    nominal = mm(float(size[1:]))
+    end_type = 1 if through else 0  # 1 through all, 0 blind
+    blind = mm(depth) if not through else 0.01  # ignored when through
+    tail = ("", False, True, True, True, True, False)  # thread class, reverse, scopes, propagate
+    if kind == "counterbore":
+        cb_d, cb_h = COUNTERBORE[size]
+        values = (mm(cb_d), mm(cb_h), 0, 1, 0, mm(cb_d) * 11.05 / 11, HALF_PI, 0, 0, 0, 0, 0)
+        return (generic, 8, fastener, size, end_type, mm(CLEARANCE[size]), blind, -1) + values + tail
+    if kind == "countersink":
+        values = (mm(COUNTERSINK[size]), HALF_PI, 0, 1, 0, 0, 0, 0, 0, -1, -1, -1)
+        return (generic, 8, fastener, size, end_type, mm(CLEARANCE[size]), blind, -1) + values + tail
+    if kind == "clearance":
+        # V1 = fit (1 normal); V3/V4 = the near-side countersink SOLIDWORKS adds by default
+        values = (1, 0, mm(CLEARANCE[size]) * 6.65 / 6.6, HALF_PI, 0, 0, 0, -1, -1, -1, -1, -1)
+        return (generic, 8, fastener, size, end_type, mm(CLEARANCE[size]), blind, -1) + values + tail
+    near = nominal * 4.05 / 4  # near-side countersink, as recorded for M4
+    if through:  # V1 thread depth (unused when the thread runs through), V8 = 1 thread through
+        values = (nominal * 9.625 / 4, near, HALF_PI, 0, 0, 0, 1 if cosmetic else 0, 1, 0, 0, -1, -1)
+    else:  # V6 = 118° drill point, V8 = 0 blind thread
+        values = (mm(thread_depth), near, HALF_PI, 0, 0, math.radians(118), 1 if cosmetic else 0, 0, 0, 0, -1, -1)
+    return (generic, 8, fastener, size, end_type, mm(TAP_DRILL[size]), blind, True) + values + tail
+
+
+def _select_face_by_ray(doc: Any, face_point: list[float]) -> None:
+    """Select the face at face_point the way the Hole Wizard recording does:
+    a ray shot onto it from just outside, which also sets the pick point."""
+    dist, face = sw.nearest(doc, "face", face_point)
+    if face is None or dist > sw.TOLERANCE:
+        raise LookupError(f"No face within 0.5 mm of {face_point} mm")
+    n = tuple(face.Normal)
+    p = tuple(mm(v) for v in face_point)
+    start = tuple(p[i] + n[i] * MM for i in range(3))
+    doc.ClearSelection2(True)
+    if not doc.Extension.SelectByRay(*start, -n[0], -n[1], -n[2], 0.0002, 2, False, 0, 0):  # 2 = faces
+        raise RuntimeError(f"Could not pick the face at {face_point} mm")
+
+
+def _hole_wizard(doc: Any, kind: str, size: str, positions: list[list[float]], face_point: list[float],
+                 depth: float, cosmetic: bool, thread_depth: float) -> dict:
+    _select_face_by_ray(doc, face_point)
+    feat = doc.FeatureManager.HoleWizard5(*_wizard_args(kind, size, depth <= 0, depth, cosmetic, thread_depth))
+    if feat is None:
+        raise RuntimeError("HoleWizard5 returned no feature")
+    try:
+        # Move the holes: replace the point the wizard placed with ours.
+        placement = sw.m0(feat, "GetFirstSubFeature")
+        doc.ClearSelection2(True)
+        placement.Select2(False, 0)
+        sw.m0(doc, "EditSketch")
+        sm = doc.SketchManager
+        if sm.ActiveSketch is None:
+            raise RuntimeError("could not edit the hole position sketch")
+        points = sw.m0(sw.m0(placement, "GetSpecificFeature2"), "GetSketchPoints2") or ()
+        doc.ClearSelection2(True)
+        for i, pt in enumerate(points):
+            sw._select_entity(doc, pt, i > 0, 0)
+        if points:
+            sw.m0(doc, "EditDelete")
+        sm.AddToDB = True
+        try:
+            for x, y in positions:
+                sm.CreatePoint(mm(x), mm(y), 0)
+        finally:
+            sm.AddToDB = False
+            sm.InsertSketch(True)
+        _rebuild(doc)
+        placed = len(sw.m0(sw.m0(placement, "GetSpecificFeature2"), "GetSketchPoints2") or ())
+        if placed != len(positions):
+            raise RuntimeError(f"the wizard hole has {placed} positions instead of {len(positions)}")
+    except Exception:
+        sw.close_open_sketch(doc)
+        doc.ClearSelection2(True)
+        feat.Select2(False, 0)
+        doc.Extension.DeleteSelection2(1)  # don't leave a half-placed wizard hole behind
+        raise
+    return {"features": [feat.Name], "method": "hole_wizard"}
+
+
 @tool
 def hole(
     size: str,
@@ -1530,19 +1618,50 @@ def hole(
     face_point: list[float] | None = None,
     plane: str = "top",
     depth: float = 0.0,
+    cosmetic_thread: bool = True,
+    thread_depth: float = 0.0,
+    wizard: bool = True,
 ) -> dict:
-    """ISO metric holes (M2-M20) at several positions at once. Place them on
-    the face at face_point ([x,y,z] mm, e.g. the top face) or on a plane;
-    positions are 2D sketch coordinates like sketch(). depth 0 = through
-    all. kind: clearance (ISO 273 medium), tapped (tap drill; the thread size
-    goes in the feature name), counterbore (socket head ISO 4762) or
-    countersink (90°, ISO 10642). Sizes come from built-in tables, so check
-    them against your drawing standard. These are sketched cuts, not Hole
-    Wizard holes: drawings get plain diameters, no hole callouts or cosmetic
-    threads."""
+    """ISO metric holes (M2-M20) at several positions at once, on the face at
+    face_point ([x,y,z] mm, e.g. the top face). positions are 2D sketch
+    coordinates like sketch() (on a top face, sketch y = -model z). depth 0
+    = through all. kind: clearance (ISO 273 normal), tapped, counterbore
+    (ISO 4762 socket head) or countersink (ISO 10642).
+
+    By default this is a real Hole Wizard hole, so drawings get hole
+    callouts; tapped holes get a cosmetic thread (cosmetic_thread=false for
+    the tap drill only) and, when blind, a thread depth (default 75 % of the
+    depth). If the wizard fails, or without face_point, or with
+    wizard=false, the holes are sketched and cut instead (no callouts);
+    "method" in the result says which happened."""
     size = size.upper().replace(" ", "")
     if size not in CLEARANCE:
         raise ValueError(f"Unknown size {size!r}; supported: {sorted(CLEARANCE, key=lambda k: float(k[1:]))}")
+    if kind == "tapped" and depth > 0:
+        thread_depth = thread_depth or round(depth * 0.75, 3)
+        if thread_depth > depth:
+            raise ValueError("thread_depth cannot exceed depth")
+    wizard_error = None
+    if wizard and face_point:
+        doc = sw.active_doc(DOC_PART)
+        try:
+            info = _hole_wizard(doc, kind, size, positions, face_point, depth, cosmetic_thread, thread_depth)
+            info.update(count=len(positions), drill_mm=TAP_DRILL[size] if kind == "tapped" else CLEARANCE[size])
+            if kind == "tapped":
+                info["thread"] = {"cosmetic": cosmetic_thread, "depth_mm": thread_depth if depth > 0 else "through"}
+            return info
+        except Exception as exc:
+            wizard_error = f"{type(exc).__name__}: {exc}"
+    info = _sketched_holes(size, positions, kind, face_point, plane, depth)
+    info["method"] = "sketch_cut"
+    if wizard_error:
+        info["wizard_error"] = wizard_error
+    elif wizard and not face_point:
+        info["note"] = "Hole Wizard needs face_point; holes were sketched and cut"
+    return info
+
+
+def _sketched_holes(size: str, positions: list[list[float]], kind: str, face_point, plane: str, depth: float) -> dict:
     where = {"face_point": face_point} if face_point else {"plane": plane}
     sketch_fn, extrude_fn = sketch.__wrapped__, extrude.__wrapped__
     d = TAP_DRILL[size] if kind == "tapped" else CLEARANCE[size]
@@ -1588,7 +1707,16 @@ def engrave(
     sk = sketch.__wrapped__([{"type": "text", "x": x, "y": y, "text": text, "height": height}],
                             face_point=face_point, dimension=False)
     feat = extrude.__wrapped__(depth=depth, sketch_name=sk["sketch"], cut=not emboss)
-    return {"sketch": sk["sketch"], **feat}
+    result = {"sketch": sk["sketch"], **feat}
+    doc = sw.active_doc(DOC_PART)
+    try:
+        doc.ClearSelection2(True)
+        sw.select_feature(doc, sk["sketch"])
+        sw.m0(doc, "BlankSketch")  # hide the text sketch so only the lettering shows
+    except Exception as exc:
+        result["note"] = f"lettering made, but the sketch could not be hidden: {exc}"
+    doc.ClearSelection2(True)
+    return result
 
 
 # --- Sweeps, lofts, ribs and 3D sketches -------------------------------------
@@ -1682,11 +1810,13 @@ def sweep(
     circle_diameter: float = 0.0,
     wall: float = 0.0,
     cut: bool = False,
+    diameter_is: Literal["outer", "inner"] = "outer",
 ) -> dict:
     """Sweep a closed profile sketch along a path sketch (2D or 3D, by name).
     Without a profile, sweep a circle of circle_diameter mm along the path
     (pipes, wires, grooves). wall > 0 makes it a hollow tube of that wall
-    thickness. cut=true removes material instead."""
+    thickness; circle_diameter is then the outer diameter (wall grows inward)
+    unless diameter_is="inner". cut=true removes material instead."""
     doc = sw.active_doc(DOC_PART)
     doc.ClearSelection2(True)
     circular = not profile
@@ -1700,7 +1830,9 @@ def sweep(
     fm = doc.FeatureManager
     # Propagate, Alignment, TwistCtrlType, KeepTangency, AdvancedSmoothing, StartMatching,
     # EndMatching, IsThin, Thickness1, Thickness2, ThinType, PathAlign, ...
-    head = (False, False, 0, False, False, 0, 0, thin, t1, t1, 0, 0)
+    # ThinType 0 grows outward from the profile (seen in testing), 1 the opposite way
+    thin_type = 1 if (thin and diameter_is == "outer") else 0
+    head = (False, False, 0, False, False, 0, 0, thin, t1, t1, thin_type, 0)
     if cut:
         tail = (True, True, 0, True)  # UseFeatScope, UseAutoSelect, TwistAngle, MergeSmoothFaces
         feat = _call_first(fm, [
@@ -1755,41 +1887,88 @@ def rib(thickness: float, sketch_name: str = "", both_sides: bool = True, flip_m
 
 
 @tool
-def sheet_metal_base_flange(thickness: float, bend_radius: float, length: float = 0.0, sketch_name: str = "", reverse: bool = False) -> dict:
-    """Start a sheet metal part from a sketch (default the most recent):
-    a closed sketch becomes a flat plate; an open profile (e.g. an L or U
-    of lines) is extruded `length` mm, centred on the sketch plane, with
-    bends of bend_radius. The result reports the length actually built."""
+def sheet_metal_base_flange(
+    thickness: float,
+    bend_radius: float,
+    length: float = 0.0,
+    sketch_name: str = "",
+    reverse: bool = False,
+    mid_plane: bool = False,
+    k_factor: float = 0.5,
+) -> dict:
+    """Start a sheet metal part from a sketch (default the most recent): a
+    closed sketch becomes a flat plate; an open profile (an L or U of lines)
+    is extruded `length` mm in one direction (reverse=true flips it,
+    mid_plane=true centres it on the sketch plane), with bends of
+    bend_radius and the given K-factor. Reports the length actually built."""
     doc = sw.active_doc(DOC_PART)
     doc.ClearSelection2(True)
     profile = sketch_name or _last_sketch_name(doc)
     sw.select_feature(doc, profile)
-    # With these arguments SOLIDWORKS extrudes both ways by the given
-    # distance each (40 gave 80 in testing), so pass half per side.
-    t, r, l = mm(thickness), mm(bend_radius), mm(length or 10) / 2
-    feat = _call_first(doc.FeatureManager, [
-        ("InsertSheetMetalBaseFlange2", (t, False, r, l, l, reverse, 0, 0, 0, sw.nothing(), False, 0.5, 0.0001, 0.0001, 0.5, True, False, True, True)),
-        ("InsertSheetMetalBaseFlange2", (t, False, r, l, l, reverse, 0, 0, 0, sw.nothing(), False, 0.5, 0.0001, 0.0001, 0.5, True, False, True)),
-    ])
+    t, r, l = mm(thickness), mm(bend_radius), mm(length or 10)
+    method, error = "feature_definition", None
+    try:
+        # As recorded in SOLIDWORKS 2025 (docs/recordings/HANDOFF.md).
+        fm = doc.FeatureManager
+        allowance = sw.m0(fm, "CreateCustomBendAllowance")
+        allowance.KFactor = k_factor
+        data = fm.CreateDefinition(sw.constant("swFmBaseFlange"))
+        sw.invoke(data, "Initialize", False, True, allowance, True, 1, True, 0.5, 0.0001, 0.0001)
+        data.Thickness = t
+        data.BendRadius = r
+        data.ReverseThickness = False
+        data.ReverseDirection = reverse
+        data.D1EndConditionType = 1  # blind, as recorded
+        data.D1ReverseOffset = False
+        data.D2EndConditionType = 1
+        data.D2ReverseOffset = False
+        if mid_plane:
+            data.OffsetDirections = 2  # both directions, half each
+            data.D1EndConditionDistance = l / 2
+            data.D2EndConditionDistance = l / 2
+        else:
+            data.OffsetDirections = 1  # one direction
+            data.D1EndConditionDistance = l
+            data.D2EndConditionDistance = 0.01
+        feat = fm.CreateFeature(data)
+        if feat is None:
+            raise RuntimeError("CreateFeature returned no feature")
+    except Exception as exc:
+        # Older path: these arguments extrude both ways by the distance
+        # each, so pass half per side (always centred).
+        error = f"{type(exc).__name__}: {exc}"
+        method = "InsertSheetMetalBaseFlange2 (centred)"
+        doc.ClearSelection2(True)
+        sw.select_feature(doc, profile)
+        h = l / 2
+        feat = _call_first(doc.FeatureManager, [
+            ("InsertSheetMetalBaseFlange2", (t, False, r, h, h, reverse, 0, 0, 0, sw.nothing(), False, 0.5, 0.0001, 0.0001, 0.5, True, False, True, True)),
+            ("InsertSheetMetalBaseFlange2", (t, False, r, h, h, reverse, 0, 0, 0, sw.nothing(), False, 0.5, 0.0001, 0.0001, 0.5, True, False, True)),
+        ])
     result = _feature_result(feat, "base flange")
+    result["method"] = method
+    if error:
+        result["definition_error"] = error
     axis = _sketch_normal_axis(sw.feature(doc, profile))
     box = doc.GetPartBox(True)
     if axis is not None and box:
-        built = round((box[3 + axis] - box[axis]) / MM, 3)
-        result["length_built_mm"] = built
-        if length and abs(built - length) > 0.01:
-            result["warning"] = f"asked for {length} mm along {'xyz'[axis]}, got {built} mm"
+        lo, hi = box[axis] / MM, box[3 + axis] / MM
+        result["length_built_mm"] = round(hi - lo, 3)
+        result["extent_mm"] = [round(lo, 3), round(hi, 3)]
+        if length and abs((hi - lo) - length) > 0.01:
+            result["warning"] = f"asked for {length} mm along {'xyz'[axis]}, got {round(hi - lo, 3)} mm"
     return result
 
 
 @tool
 def flatten(flat: bool = True) -> str:
-    """Show a sheet metal part flat (true) or folded (false)."""
+    """Show a sheet metal part flat (true) or folded (false), in the active
+    configuration."""
     doc = sw.active_doc(DOC_PART)
     flat_pattern = next((f for f in sw.iter_features(doc) if sw.m0(f, "GetTypeName2") == "FlatPattern"), None)
     if flat_pattern is None:
         raise LookupError("No flat pattern: this is not a sheet metal part")
-    if not _call_first(flat_pattern, [("SetSuppression2", (1 if flat else 0, 2, sw.nothing()))]):
+    if not _call_first(flat_pattern, [("SetSuppression2", (1 if flat else 0, 1, sw.nothing()))]):  # 1 = this configuration
         raise RuntimeError("Could not change the flat pattern state")
     _rebuild(doc)
     return "flattened" if flat else "folded"
