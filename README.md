@@ -34,10 +34,13 @@ SOLIDWORKS 2025 SP2 기준으로 작성했습니다.
 
 ## 설치 (SOLIDWORKS가 깔린 Windows PC)
 
+업데이트는 `cd C:\mcp\solidworks-mcp` 후 `git pull`, 그리고 Claude Desktop 재시작입니다.
+
 Python 3.11 이상이 필요합니다.
 
 ```powershell
-cd solidworks-mcp
+git clone https://github.com/Saqnes/solidworks-mcp C:\mcp\solidworks-mcp
+cd C:\mcp\solidworks-mcp
 python -m venv .venv
 .venv\Scripts\pip install -e .
 ```
@@ -50,8 +53,8 @@ python -m venv .venv
 {
   "mcpServers": {
     "solidworks": {
-      "command": "C:\\path\\to\\personalproject\\solidworks-mcp\\.venv\\Scripts\\python.exe",
-      "args": ["C:\\path\\to\\personalproject\\solidworks-mcp\\server.py"]
+      "command": "C:\\mcp\\solidworks-mcp\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\mcp\\solidworks-mcp\\server.py"]
     }
   }
 }
@@ -60,7 +63,7 @@ python -m venv .venv
 ### Claude Code
 
 ```powershell
-claude mcp add solidworks -- C:\path\to\personalproject\solidworks-mcp\.venv\Scripts\python.exe C:\path\to\personalproject\solidworks-mcp\server.py
+claude mcp add solidworks -- C:\mcp\solidworks-mcp\.venv\Scripts\python.exe C:\mcp\solidworks-mcp\server.py
 ```
 
 SOLIDWORKS가 실행 중이면 그 창에 연결하고, 실행 중이 아니면 새로 띄웁니다.
