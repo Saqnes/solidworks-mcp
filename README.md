@@ -31,6 +31,7 @@ SOLIDWORKS 2025 SP2 기준으로 작성했습니다.
 `model_info`의 바운딩박스와 `screenshot`으로 Claude가 좌표를 잡습니다.
 전용 도구가 없는 기능(판금 엣지 플랜지, 구배, 서피스, 용접 구조물 등)은 `run_api_script`로 처리합니다.
 `hole`은 SOLIDWORKS Hole Wizard로 만들어 도면 구멍 표기(callout)와 나사산 표시가 붙습니다. 인자는 녹화한 매크로(`docs/recordings/`)에서 가져왔습니다. Hole Wizard가 실패하거나 `face_point` 없이 부르면 내장 ISO 표 기준의 스케치+컷으로 대신 만들고, 결과의 `method`로 알려 줍니다.
+Windows에서 "Beta: 세계 언어 지원을 위해 Unicode UTF-8 사용"이 켜져 있으면 SOLIDWORKS의 PDF 내보내기가 한글이 든 글자(구멍 표기의 "관통", 주석 등)를 통째로 빠뜨립니다. 이때 도면 PDF는 자동으로 "Microsoft Print to PDF" 프린터로 인쇄해 만듭니다(`export`의 `pdf_method`로 바꿀 수 있음).
 
 도구 하나가 90초(`SW_TIMEOUT` 환경변수로 변경) 안에 끝나지 않으면 오류로 돌아오고, 그 호출이 끝날 때까지 다음 호출은 바로 거절됩니다. 대개 SOLIDWORKS에 대화상자가 떠 있는 경우이니 닫고 다시 시도하세요.
 

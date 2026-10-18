@@ -183,16 +183,73 @@ def save(path: str = "") -> dict:
     return {**sw.doc_info(doc), "warnings": warnings.value}
 
 
+PDF_PRINTER = "Microsoft Print to PDF"
+# Windows paper sizes (DMPAPER_*) by sheet size in mm, long side first
+PAPER_SIZES = {(297, 210): 9, (420, 297): 8, (594, 420): 66, (279, 216): 1, (432, 279): 3}
+
+
+def _utf8_codepage() -> bool:
+    """Whether Windows runs with "Beta: Use Unicode UTF-8" (ANSI code page
+    65001). SOLIDWORKS' PDF export then leaves out every text run with
+    Korean (or other non-Latin) characters, though the screen shows them."""
+    import ctypes
+
+    return ctypes.windll.kernel32.GetACP() == 65001
+
+
+def _print_pdf(drw: Any, target: str, before: float | None) -> None:
+    """Print the drawing to "Microsoft Print to PDF", scaled to fit paper of
+    the sheet's size; Windows' printing keeps the text SaveAs drops."""
+    import pythoncom
+    from win32com.client import VARIANT
+
+    props = sw.m0(sw.m0(drw, "GetCurrentSheet"), "GetProperties2")  # ..., width, height (m)
+    w, h = round(props[5] * 1000), round(props[6] * 1000)
+    paper = PAPER_SIZES.get((max(w, h), min(w, h)), 8)
+    ps = drw.PageSetup
+    saved = (ps.ScaleToFit, ps.Orientation, ps.PrinterPaperSize)
+    ps.ScaleToFit, ps.Orientation, ps.PrinterPaperSize = True, 2 if w >= h else 1, paper
+    try:
+        pages = VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_I4, [1, max(1, sw.m0(drw, "GetSheetCount"))])
+        drw.Extension.PrintOut2(pages, 1, False, PDF_PRINTER, target)
+    finally:
+        ps.ScaleToFit, ps.Orientation, ps.PrinterPaperSize = saved
+    # the spooler writes the file after PrintOut2 returns
+    size, deadline = -1, time.time() + 60
+    while time.time() < deadline:
+        if sw.file_written(target, before):
+            now = os.path.getsize(target)
+            if now > 0 and now == size:
+                return
+            size = now
+        time.sleep(0.5)
+    raise RuntimeError(f"{PDF_PRINTER} did not write {target}")
+
+
 @tool
-def export(path: str) -> dict:
+def export(path: str, pdf_method: Literal["auto", "export", "print"] = "auto") -> dict:
     """Export a copy of the active document; the format follows the extension
     (.step/.stp, .igs, .x_t, .stl, .3mf, .pdf, .dxf/.dwg (drawings), .png/.jpg,
-    .eDrawings). The open document keeps its own file."""
+    .eDrawings). The open document keeps its own file.
+
+    Drawing PDFs: with Windows' UTF-8 code page SOLIDWORKS' own PDF export
+    drops Korean text (e.g. "관통" in hole callouts), so "auto" then prints
+    to "Microsoft Print to PDF" instead; "export"/"print" force a method."""
     doc = sw.active_doc()
     errors, warnings = sw.out_int(), sw.out_int()
     target = str(Path(path))
     _check_not_open_elsewhere(doc, target)
     before = sw.mtime(target)
+    if target.lower().endswith(".pdf") and sw.m0(doc, "GetType") == DOC_DRAWING:
+        import win32print
+
+        printers = [p[2] for p in win32print.EnumPrinters(2 | 4)]  # local and network printers
+        use_print = pdf_method == "print" or (pdf_method == "auto" and _utf8_codepage() and PDF_PRINTER in printers)
+        if use_print:
+            if PDF_PRINTER not in printers:
+                raise RuntimeError(f'Printer "{PDF_PRINTER}" is not installed')
+            _print_pdf(doc, target, before)
+            return {"path": target, "bytes": os.path.getsize(target), "method": "print"}
     ok = doc.Extension.SaveAs3(target, 0, 1 | 2, sw.nothing(), sw.nothing(), errors, warnings)  # silent | copy
     if not ok or not sw.file_written(target, before):
         raise RuntimeError(f"Export failed ({_save_error(errors.value)}) for {target}")
