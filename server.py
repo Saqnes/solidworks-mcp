@@ -13,6 +13,7 @@ import functools
 import io
 import math
 import os
+import re
 import tempfile
 import time
 import traceback
@@ -38,20 +39,24 @@ mcp = MCPServer(
 )
 
 
-def tool(fn):
+def tool(fn=None, *, timeout: float | None = None):
     """Register fn as a tool. Its body runs on the COM thread, and any failure
-    (including COM errors) comes back to the agent as a readable error."""
+    (including COM errors and timeouts) comes back to the agent as a
+    readable error. Long-running tools pass a larger timeout (seconds)."""
 
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        try:
-            return call(lambda: fn(*args, **kwargs))
-        except ToolError:
-            raise
-        except Exception as exc:
-            raise ToolError(f"{type(exc).__name__}: {exc}") from exc
+    def register(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                return call(lambda: fn(*args, **kwargs), timeout)
+            except ToolError:
+                raise
+            except Exception as exc:
+                raise ToolError(f"{type(exc).__name__}: {exc}") from exc
 
-    return mcp.tool()(wrapper)
+        return mcp.tool()(wrapper)
+
+    return register(fn) if fn is not None else register
 
 
 def _rebuild(doc: Any) -> None:
@@ -178,8 +183,9 @@ def export(path: str) -> dict:
     errors, warnings = sw.out_int(), sw.out_int()
     target = str(Path(path))
     _check_not_open_elsewhere(doc, target)
+    before = sw.mtime(target)
     ok = doc.Extension.SaveAs3(target, 0, 1 | 2, sw.nothing(), sw.nothing(), errors, warnings)  # silent | copy
-    if not ok or not os.path.exists(target):
+    if not ok or not sw.file_written(target, before):
         raise RuntimeError(f"Export failed ({_save_error(errors.value)}) for {target}")
     return {"path": target, "bytes": os.path.getsize(target), "warnings": warnings.value}
 
@@ -364,16 +370,17 @@ def delete_feature(name: str, keep_sketches: bool = False) -> dict:
     """Delete a feature. Sketches it absorbed (used only by this feature) are
     deleted with it unless keep_sketches=true."""
     doc = sw.active_doc()
+    sw.close_open_sketch(doc)  # a sketch left in edit mode blocks deletion
     feat = sw.feature(doc, name)
     absorbed = []
     if not keep_sketches:
         for parent in sw.m0(feat, "GetParents") or ():
-            if sw.m0(parent, "GetTypeName2") == "ProfileFeature" and len(sw.m0(parent, "GetChildren") or ()) <= 1:
+            if sw.m0(parent, "GetTypeName2") in ("ProfileFeature", "3DProfileFeature") and len(sw.m0(parent, "GetChildren") or ()) <= 1:
                 absorbed.append(parent.Name)
     doc.ClearSelection2(True)
     sw.select_feature(doc, name)
     if not doc.Extension.DeleteSelection2(1):  # swDelete_Absorbed
-        raise RuntimeError(f"Could not delete {name!r} (other features may depend on it)")
+        raise RuntimeError(f"SOLIDWORKS refused to delete {name!r}; check list_features and a screenshot for what still uses it")
     deleted = [name]
     for sk in absorbed:
         if doc.FeatureByName(sk) is not None:  # not taken along by the delete above
@@ -467,7 +474,7 @@ def custom_properties(set_values: dict[str, str] | None = None) -> dict[str, str
 # --- Part modelling -------------------------------------------------------
 
 
-def _sketch_entity(sm: Any, e: dict) -> Any:
+def _sketch_entity(sm: Any, e: dict, doc: Any = None) -> Any:
     t = e.get("type")
     g = lambda k, d=None: mm(e[k]) if k in e else d  # noqa: E731
     if t == "line":
@@ -499,8 +506,16 @@ def _sketch_entity(sm: Any, e: dict) -> Any:
         pts = [c for x, y in e["points"] for c in (mm(x), mm(y), 0.0)]
         return sm.CreateSpline2(sw.doubles(pts), True)
     if t == "text":
-        # x, y = lower-left corner; height follows the document's default font
-        return sm.InsertSketchText(g("x", 0.0), g("y", 0.0), 0, str(e["text"]), 0, 0, 0, 100, 100)
+        # IModelDoc2.InsertSketchText (not the sketch manager); x, y = lower-left corner
+        st = doc.InsertSketchText(g("x", 0.0), g("y", 0.0), 0, str(e["text"]), 0, 0, 0, 100, 100)
+        if st is not None and "height" in e:
+            try:
+                fmt = sw.m0(st, "GetTextFormat")
+                fmt.CharHeight = g("height")
+                st.SetTextFormat(False, fmt)
+            except Exception as exc:
+                raise RuntimeError(f"text placed, but its height could not be set: {exc}") from exc
+        return st
     raise ValueError(f"Unknown sketch entity type {t!r}")
 
 
@@ -789,7 +804,7 @@ def _draw(doc: Any, entities: list[dict], dimension: bool) -> tuple[Any, list[in
     state = None
     try:
         for i, e in enumerate(entities):
-            made = _sketch_entity(sm, e)
+            made = _sketch_entity(sm, e, doc)
             if made is None:
                 failed.append(i)
             created.append(made)
@@ -822,7 +837,7 @@ def sketch(entities: list[dict], plane: str = "front", face_point: list[float] |
       {"type":"arc","cx","cy","x1","y1","x2","y2","clockwise":false}
       {"type":"slot","x1","y1","x2","y2","width"}  {"type":"point","x","y"}
       {"type":"ellipse","cx","cy","major_radius","minor_radius","angle":0}
-      {"type":"spline","points":[[x,y],...]}  {"type":"text","x","y","text"} (cut it to engrave)
+      {"type":"spline","points":[[x,y],...]}  {"type":"text","x","y","text","height"} (or use engrave)
     Profiles for extrude must be closed; a revolve profile needs one centerline as its axis.
     dimension=true (default) adds design-intent dimensions (overall
     rectangle width/height, one diameter per hole size with equal relations,
@@ -839,6 +854,7 @@ def sketch(entities: list[dict], plane: str = "front", face_point: list[float] |
         else:
             target = sw.feature(doc, plane)
             expected = sw._plane_normal_axis(target)
+    sw.close_open_sketch(doc)  # InsertSketch toggles: a leftover open sketch would be closed instead
     # A freshly created part sometimes is not ready for sketching yet: make
     # sure it is the active window and retry opening the sketch briefly.
     sw.app().ActivateDoc3(sw.m0(doc, "GetTitle"), False, 0, sw.out_int())
@@ -1028,7 +1044,7 @@ def add_mate(
 # --- Drawings -------------------------------------------------------------
 
 
-@tool
+@tool(timeout=300)
 def make_drawing(model_path: str = "", projection: Literal["third_angle", "first_angle"] = "third_angle", import_dimensions: bool = True) -> dict:
     """Create a drawing with the standard three views (plus model dimensions)
     of a saved part/assembly; default the active document. Export it as PDF
@@ -1245,24 +1261,35 @@ def list_equations() -> list[dict]:
     return _equations(sw.m0(sw.active_doc(), "GetEquationMgr"))
 
 
+def _eq_norm(text: str) -> str:
+    """Equation text as SOLIDWORKS may rewrite it: spacing, case, units."""
+    return re.sub(r"(?<=\d)mm\b", "", "".join(text.split()).lower())
+
+
 def _replace_equation(eqm: Any, index: int, old: str, text: str) -> None:
     """Edit equation `index` in place (so dimensions referencing a global
-    variable stay linked); if SOLIDWORKS refuses, leave the old one intact."""
-    try:
-        sw.put_indexed(eqm, "Equation", index, text)
-        if eqm.Equation(index).replace(" ", "") == text.replace(" ", ""):
+    variable stay linked); if SOLIDWORKS refuses, leave the old one intact.
+    Success means the stored text changed away from the old one, since
+    SOLIDWORKS may reformat what it stores."""
+    errors = []
+    attempts = (
+        ("Equation property", lambda: sw.put_indexed(eqm, "Equation", index, text)),
+        ("SetEquationAndConfigurationOption",
+         lambda: _call_first(eqm, [("SetEquationAndConfigurationOption", (index, text, 0, sw.nothing()))])),
+    )
+    for label, attempt in attempts:
+        try:
+            attempt()
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+            continue
+        stored = eqm.Equation(index)
+        if _eq_norm(stored) == _eq_norm(text) or _eq_norm(stored) != _eq_norm(old):
             return
-    except Exception:
-        pass
-    try:  # the same edit through the configuration-aware setter
-        _call_first(eqm, [("SetEquationAndConfigurationOption", (index, text, 0, sw.nothing()))])
-        if eqm.Equation(index).replace(" ", "") == text.replace(" ", ""):
-            return
-    except Exception:
-        pass
-    if eqm.Equation(index).replace(" ", "") != old.replace(" ", ""):
+        errors.append(f"{label}: no change")
+    if _eq_norm(eqm.Equation(index)) != _eq_norm(old):
         sw.put_indexed(eqm, "Equation", index, old)
-    raise RuntimeError(f"SOLIDWORKS rejected {text!r}; kept {old!r}")
+    raise RuntimeError(f"SOLIDWORKS rejected {text!r}; kept {old!r} ({'; '.join(errors)})")
 
 
 @tool
@@ -1285,7 +1312,7 @@ def set_equation(lhs: str, rhs: str) -> list[dict]:
     try:
         sw.invoke(eqm, "EvaluateAll")
     except Exception:
-        pass  # the rebuild below evaluates them too
+        pass  # optional: the rebuild below evaluates equations as well
     _rebuild(doc)
     return _equations(eqm)
 
@@ -1367,7 +1394,7 @@ def measure(
                 if sw.invoke(m, "Calculate", sw.nothing()) and m.Distance >= 0:
                     by_option[option] = round(m.Distance / MM, 4)
             except Exception:
-                pass
+                continue  # this option is unsupported for the selection; report the other
         if len(set(by_option.values())) == 2:
             centre, minimum = by_option[0], by_option[1]
             out["center_to_center_mm"], out["minimum_mm"] = max(centre, minimum), min(centre, minimum)
@@ -1425,7 +1452,7 @@ def set_color(rgb: list[int]) -> str:
     return f"coloured {sw.m0(doc, 'GetTitle')} {list(rgb)}"
 
 
-@tool
+@tool(timeout=1800)
 def export_folder(folder: str, extension: str = "step", recursive: bool = False, overwrite: bool = False) -> list[dict]:
     """Export every .sldprt/.sldasm in a folder to another format (step,
     igs, x_t, stl, 3mf, pdf ...), next to the originals. Files already open
@@ -1453,8 +1480,9 @@ def export_folder(folder: str, extension: str = "step", recursive: bool = False,
                     results.append({"file": src.name, "error": f"open failed (swFileLoadError {errors.value})"})
                     continue
             errors, warnings = sw.out_int(), sw.out_int()
+            before = sw.mtime(str(target))
             ok = doc.Extension.SaveAs3(str(target), 0, 1 | 2, sw.nothing(), sw.nothing(), errors, warnings)
-            if ok and target.exists():
+            if ok and sw.file_written(str(target), before):
                 results.append({"file": src.name, "exported": target.name, "bytes": target.stat().st_size})
             else:
                 results.append({"file": src.name, "error": _save_error(errors.value)})
@@ -1509,27 +1537,32 @@ def hole(
     all. kind: clearance (ISO 273 medium), tapped (tap drill; the thread size
     goes in the feature name), counterbore (socket head ISO 4762) or
     countersink (90°, ISO 10642). Sizes come from built-in tables, so check
-    them against your drawing standard."""
+    them against your drawing standard. These are sketched cuts, not Hole
+    Wizard holes: drawings get plain diameters, no hole callouts or cosmetic
+    threads."""
     size = size.upper().replace(" ", "")
     if size not in CLEARANCE:
         raise ValueError(f"Unknown size {size!r}; supported: {sorted(CLEARANCE, key=lambda k: float(k[1:]))}")
     where = {"face_point": face_point} if face_point else {"plane": plane}
     sketch_fn, extrude_fn = sketch.__wrapped__, extrude.__wrapped__
+    d = TAP_DRILL[size] if kind == "tapped" else CLEARANCE[size]
+    # Sketch everything while the face is still intact: after the first cut
+    # face_point may sit over a hole and pick a different face.
+    seat = None
+    if kind == "counterbore":
+        seat = sketch_fn(_circles(positions, COUNTERBORE[size][0]), **where)["sketch"]
+    elif kind == "countersink":
+        seat = sketch_fn(_circles(positions, COUNTERSINK[size]), **where)["sketch"]
+    drill = sketch_fn(_circles(positions, d), **where)["sketch"]
     made = []
     if kind == "counterbore":
-        cb_d, cb_h = COUNTERBORE[size]
-        sk = sketch_fn(_circles(positions, cb_d), **where)["sketch"]
-        made.append(_rename(extrude_fn(depth=cb_h, sketch_name=sk, cut=True)["feature"], f"{size} 카운터보어 자리"))
+        made.append(_rename(extrude_fn(depth=COUNTERBORE[size][1], sketch_name=seat, cut=True)["feature"], f"{size} 카운터보어 자리"))
     elif kind == "countersink":
-        d = CLEARANCE[size]
-        cs_d = COUNTERSINK[size]
-        sk = sketch_fn(_circles(positions, cs_d), **where)["sketch"]
         # a 45° inward draft from the countersink diameter down to the hole
-        made.append(_rename(extrude_fn(depth=round((cs_d - d) / 2, 4), sketch_name=sk, cut=True, draft_angle=45)["feature"], f"{size} 카운터싱크 자리"))
-    d = TAP_DRILL[size] if kind == "tapped" else CLEARANCE[size]
-    sk = sketch_fn(_circles(positions, d), **where)["sketch"]
+        sink = round((COUNTERSINK[size] - d) / 2, 4)
+        made.append(_rename(extrude_fn(depth=sink, sketch_name=seat, cut=True, draft_angle=45)["feature"], f"{size} 카운터싱크 자리"))
     end = "blind" if depth > 0 else "through_all"
-    hole_feat = extrude_fn(depth=depth or 10.0, sketch_name=sk, cut=True, end=end)["feature"]
+    hole_feat = extrude_fn(depth=depth or 10.0, sketch_name=drill, cut=True, end=end)["feature"]
     made.append(_rename(hole_feat, f"{size} {HOLE_NAMES[kind]}"))
     info = {"features": made, "count": len(positions), "drill_mm": d}
     if kind == "counterbore":
@@ -1539,7 +1572,56 @@ def hole(
     return info
 
 
+@tool
+def engrave(
+    text: str,
+    face_point: list[float],
+    x: float = 0.0,
+    y: float = 0.0,
+    height: float = 5.0,
+    depth: float = 0.5,
+    emboss: bool = False,
+) -> dict:
+    """Engrave (cut) or emboss (raise) text on the planar face at face_point
+    (mm). x, y = lower-left corner of the text in sketch coordinates like
+    sketch(); height = character height, depth = cut/raise depth (mm)."""
+    sk = sketch.__wrapped__([{"type": "text", "x": x, "y": y, "text": text, "height": height}],
+                            face_point=face_point, dimension=False)
+    feat = extrude.__wrapped__(depth=depth, sketch_name=sk["sketch"], cut=not emboss)
+    return {"sketch": sk["sketch"], **feat}
+
+
 # --- Sweeps, lofts, ribs and 3D sketches -------------------------------------
+
+
+def _open_3d_sketch(doc: Any) -> Any:
+    sm = doc.SketchManager
+    sw.close_open_sketch(doc)
+    doc.ClearSelection2(True)
+    for opener in (lambda: sm.Insert3DSketch(True), lambda: doc.Insert3DSketch2(True)):
+        try:
+            opener()
+        except Exception:
+            continue
+        sk = sm.ActiveSketch
+        if sk is not None:
+            return sk
+    raise RuntimeError("SOLIDWORKS did not open a 3D sketch (Insert3DSketch left no active sketch)")
+
+
+def _create_3d(sm: Any, e: dict) -> int:
+    """Draw one 3D entity; returns how many segments were created."""
+    t = e.get("type")
+    if t == "line":
+        pairs = [(e["p1"], e["p2"])]
+    elif t == "polyline":
+        pts = e["points"]
+        pairs = list(zip(pts, pts[1:]))
+    elif t == "spline":
+        return int(sm.CreateSpline2(sw.doubles([mm(v) for p in e["points"] for v in p]), True) is not None)
+    else:
+        raise ValueError(f"Unknown 3D sketch entity type {t!r}")
+    return sum(sm.CreateLine(*(mm(v) for v in a), *(mm(v) for v in b)) is not None for a, b in pairs)
 
 
 @tool
@@ -1547,34 +1629,39 @@ def sketch3d(entities: list[dict]) -> dict:
     """3D sketch in model coordinates (mm), e.g. a sweep path. Entities:
       {"type":"polyline","points":[[x,y,z],...]}  (connected lines)
       {"type":"line","p1":[x,y,z],"p2":[x,y,z]}
-      {"type":"spline","points":[[x,y,z],...]}"""
+      {"type":"spline","points":[[x,y,z],...]}
+    An empty result is deleted again, and failures say why."""
     doc = sw.active_doc(DOC_PART)
-    doc.ClearSelection2(True)
     sm = doc.SketchManager
-    sm.Insert3DSketch(True)
-    sm.AddToDB = True
-    failed = []
+    _open_3d_sketch(doc)
+    made, problems = 0, []
     try:
         for i, e in enumerate(entities):
-            t = e.get("type")
-            if t == "line":
-                ok = sm.CreateLine(*(mm(v) for v in e["p1"]), *(mm(v) for v in e["p2"])) is not None
-            elif t == "polyline":
-                pts = e["points"]
-                ok = all(sm.CreateLine(*(mm(v) for v in a), *(mm(v) for v in b)) is not None for a, b in zip(pts, pts[1:]))
-            elif t == "spline":
-                ok = sm.CreateSpline2(sw.doubles([mm(v) for p in e["points"] for v in p]), True) is not None
-            else:
-                raise ValueError(f"Unknown 3D sketch entity type {t!r}")
-            if not ok:
-                failed.append(i)
+            try:
+                n = 0
+                for add_to_db in (True, False):  # retry without AddToDB if nothing was drawn
+                    sm.AddToDB = add_to_db
+                    n = _create_3d(sm, e)
+                    if n:
+                        break
+                if not n:
+                    problems.append({"entity": i, "error": "SOLIDWORKS created nothing", "sketch_open": sm.ActiveSketch is not None})
+                made += n
+            except Exception as exc:
+                problems.append({"entity": i, "error": f"{type(exc).__name__}: {exc}", "sketch_open": sm.ActiveSketch is not None})
     finally:
         sm.AddToDB = False
-        sm.Insert3DSketch(True)
+        if sm.ActiveSketch is not None:
+            sm.Insert3DSketch(True)
     feat = sw.last_feature_of_type(doc, "3DProfileFeature")
-    result = {"sketch": feat.Name, "entities": len(entities) - len(failed)}
-    if failed:
-        result["failed_entities"] = failed
+    if not made:
+        doc.ClearSelection2(True)
+        feat.Select2(False, 0)
+        doc.Extension.DeleteSelection2(0)
+        raise RuntimeError(f"No 3D sketch entities could be created; removed the empty sketch. Details: {problems}")
+    result = {"sketch": feat.Name, "segments": made}
+    if problems:
+        result["problems"] = problems
     return result
 
 
@@ -1671,17 +1758,28 @@ def rib(thickness: float, sketch_name: str = "", both_sides: bool = True, flip_m
 def sheet_metal_base_flange(thickness: float, bend_radius: float, length: float = 0.0, sketch_name: str = "", reverse: bool = False) -> dict:
     """Start a sheet metal part from a sketch (default the most recent):
     a closed sketch becomes a flat plate; an open profile (e.g. an L or U
-    of lines) is extruded `length` mm with bends of bend_radius. Experimental:
-    report the error text if it fails."""
+    of lines) is extruded `length` mm, centred on the sketch plane, with
+    bends of bend_radius. The result reports the length actually built."""
     doc = sw.active_doc(DOC_PART)
     doc.ClearSelection2(True)
-    sw.select_feature(doc, sketch_name or _last_sketch_name(doc))
-    t, r, l = mm(thickness), mm(bend_radius), mm(length or 10)
+    profile = sketch_name or _last_sketch_name(doc)
+    sw.select_feature(doc, profile)
+    # With these arguments SOLIDWORKS extrudes both ways by the given
+    # distance each (40 gave 80 in testing), so pass half per side.
+    t, r, l = mm(thickness), mm(bend_radius), mm(length or 10) / 2
     feat = _call_first(doc.FeatureManager, [
         ("InsertSheetMetalBaseFlange2", (t, False, r, l, l, reverse, 0, 0, 0, sw.nothing(), False, 0.5, 0.0001, 0.0001, 0.5, True, False, True, True)),
         ("InsertSheetMetalBaseFlange2", (t, False, r, l, l, reverse, 0, 0, 0, sw.nothing(), False, 0.5, 0.0001, 0.0001, 0.5, True, False, True)),
     ])
-    return _feature_result(feat, "base flange")
+    result = _feature_result(feat, "base flange")
+    axis = _sketch_normal_axis(sw.feature(doc, profile))
+    box = doc.GetPartBox(True)
+    if axis is not None and box:
+        built = round((box[3 + axis] - box[axis]) / MM, 3)
+        result["length_built_mm"] = built
+        if length and abs(built - length) > 0.01:
+            result["warning"] = f"asked for {length} mm along {'xyz'[axis]}, got {built} mm"
+    return result
 
 
 @tool
@@ -1707,8 +1805,9 @@ def export_flat_pattern(path: str, bend_lines: bool = True) -> dict:
         raise RuntimeError("Save the part first; the export reads the saved model")
     target = str(Path(path))
     options = 1 | (4 if bend_lines else 0)  # geometry, bend lines
+    before = sw.mtime(target)
     ok = doc.ExportToDWG2(target, model, 1, True, sw.nothing(), False, False, options, sw.nothing())  # 1 = sheet metal
-    if not ok or not os.path.exists(target):
+    if not ok or not sw.file_written(target, before):
         raise RuntimeError(f"Flat pattern export failed for {target}")
     return {"path": target, "bytes": os.path.getsize(target)}
 

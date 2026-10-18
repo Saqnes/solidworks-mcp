@@ -14,7 +14,7 @@ SOLIDWORKS 2025 SP2 기준으로 작성했습니다.
 | 확인 | `list_features`, `list_dimensions`, `model_info`(질량·부피·무게중심·바운딩박스·재질), `screenshot`(뷰 방향 지정 가능) |
 | 수정 | `set_dimension`, `rebuild`, `undo`, `delete_feature`, `suppress_feature`, `list_materials`, `set_material`, `custom_properties` |
 | 파트 모델링 | `sketch`(선·중심선·사각형·원·호·다각형·슬롯·점·타원·스플라인·글자, 평면 또는 면 위, 설계 의도 치수·대칭 구속 자동), `extrude`(보스/컷, 블라인드·관통·중간평면·구배), `revolve`, `fillet`, `chamfer`, `shell` |
-| 구멍 | `hole`(ISO M2~M20 관통·탭·카운터보어·카운터싱크, 여러 위치 한 번에) |
+| 구멍·각인 | `hole`(ISO M2~M20 관통·탭·카운터보어·카운터싱크, 여러 위치 한 번에), `engrave`(글자 각인·양각) |
 | 스윕·로프트 | `sketch3d`(3D 경로), `sweep`(단면 또는 원형 파이프·튜브, 컷 가능), `loft`(가이드 커브, 컷 가능), `rib` |
 | 판금 | `sheet_metal_base_flange`, `flatten`(펼치기/접기), `export_flat_pattern`(전개도 DXF, 벤드 라인 포함) |
 | 패턴·참조 | `linear_pattern`, `circular_pattern`, `mirror`, `offset_plane`, `reference_axis` |
@@ -30,7 +30,9 @@ SOLIDWORKS 2025 SP2 기준으로 작성했습니다.
 재질 이름은 라이브러리 이름과 정확히 같아야 하므로, 모르면 `list_materials("6061")`처럼 먼저 검색하세요.
 `model_info`의 바운딩박스와 `screenshot`으로 Claude가 좌표를 잡습니다.
 전용 도구가 없는 기능(판금 엣지 플랜지, 구배, 서피스, 용접 구조물 등)은 `run_api_script`로 처리합니다.
-`hole`의 치수는 내장 ISO 표(ISO 273 중간 등급 관통, 탭 드릴, ISO 4762 카운터보어, ISO 10642 카운터싱크) 기준이므로 사내 규격과 다르면 확인하세요.
+`hole`의 치수는 내장 ISO 표(ISO 273 중간 등급 관통, 탭 드릴, ISO 4762 카운터보어, ISO 10642 카운터싱크) 기준이므로 사내 규격과 다르면 확인하세요. 스케치+컷으로 만들기 때문에 Hole Wizard 구멍과 달리 도면 구멍 표기(callout)와 나사산 표시는 붙지 않습니다.
+
+도구 하나가 90초(`SW_TIMEOUT` 환경변수로 변경) 안에 끝나지 않으면 오류로 돌아오고, 그 호출이 끝날 때까지 다음 호출은 바로 거절됩니다. 대개 SOLIDWORKS에 대화상자가 떠 있는 경우이니 닫고 다시 시도하세요.
 
 ## 설치 (SOLIDWORKS가 깔린 Windows PC)
 

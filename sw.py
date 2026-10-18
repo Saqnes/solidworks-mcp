@@ -11,7 +11,8 @@ from __future__ import annotations
 import math
 import os
 import inspect
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from typing import Any, Callable, TypeVar
 
 T = TypeVar("T")
@@ -36,9 +37,31 @@ def _init_com() -> None:
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sw-com", initializer=_init_com)
 
 
-def call(fn: Callable[[], T]) -> T:
-    """Run fn on the COM thread and return its result (or raise its error)."""
-    return _executor.submit(fn).result()
+DEFAULT_TIMEOUT = float(os.environ.get("SW_TIMEOUT", "90"))
+_pending: Future | None = None
+
+
+def call(fn: Callable[[], T], timeout: float | None = None) -> T:
+    """Run fn on the COM thread and return its result (or raise its error).
+
+    There is one COM thread, so a call stuck in SOLIDWORKS (typically behind
+    a modal dialog) would block every later tool. Give up after `timeout`
+    seconds, and refuse new work while the stuck call is still running."""
+    global _pending
+    if _pending is not None and not _pending.done():
+        raise RuntimeError(
+            "SOLIDWORKS is still busy with an earlier request that timed out. "
+            "Look for an open dialog in SOLIDWORKS, close it, then retry."
+        )
+    _pending = _executor.submit(fn)
+    limit = timeout or DEFAULT_TIMEOUT
+    try:
+        return _pending.result(timeout=limit)
+    except FutureTimeout:
+        raise RuntimeError(
+            f"SOLIDWORKS did not answer within {limit:.0f} s. A dialog may be waiting "
+            "in SOLIDWORKS; close it. The request may still finish in the background."
+        ) from None
 
 
 # --- COM argument helpers -------------------------------------------------
@@ -104,8 +127,41 @@ def invoke(obj: Any, name: str, *args: Any) -> Any:
     """Call an API method whose arguments are all optional. Late binding may
     already have invoked it (with no arguments) and handed back its result,
     e.g. IMeasure.Calculate arriving as a bool."""
+    flag = getattr(obj, "_FlagAsMethod", None)  # pywin32: treat `name` as a method from now on
+    if flag is not None:
+        try:
+            flag(name)
+        except Exception:
+            pass  # not a dynamic dispatch object; inspect what getattr returns instead
     attr = getattr(obj, name)
     return attr(*args) if inspect.isroutine(attr) else attr
+
+
+def close_open_sketch(doc: Any) -> bool:
+    """Leave sketch edit mode if a 2D or 3D sketch is open (a leftover edit
+    blocks deleting features and opening new sketches)."""
+    sm = doc.SketchManager
+    sk = sm.ActiveSketch
+    if sk is None:
+        return False
+    try:
+        is3d = bool(invoke(sk, "Is3D"))
+    except Exception:
+        is3d = False
+    (sm.Insert3DSketch if is3d else sm.InsertSketch)(True)
+    return True
+
+
+def file_written(path: str, before: float | None) -> bool:
+    """True if `path` exists and was (re)written after mtime `before`
+    (None = did not exist), so a stale file is not taken for success."""
+    if not os.path.exists(path):
+        return False
+    return before is None or os.path.getmtime(path) > before
+
+
+def mtime(path: str) -> float | None:
+    return os.path.getmtime(path) if os.path.exists(path) else None
 
 
 def put_indexed(obj: Any, name: str, index: Any, value: Any) -> None:
