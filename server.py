@@ -1044,11 +1044,68 @@ def add_mate(
 # --- Drawings -------------------------------------------------------------
 
 
+def _hole_callouts(drw: Any) -> dict:
+    """Add one hole callout per Hole Wizard feature, on a view where its
+    holes appear as circles; SOLIDWORKS adds the instance count ("2X")."""
+    edge_kind = sw.constant("swViewEntityType_Edge")
+    done: dict[str, str] = {}
+    notes: list[str] = []
+    view = sw.m0(drw, "GetFirstView")
+    view = sw.m0(view, "GetNextView") if view is not None else None  # skip the sheet
+    while view is not None:
+        stack = 0
+        for edge in view.GetVisibleEntities2(sw.nothing(), edge_kind) or ():
+            try:
+                curve = sw.m0(edge, "GetCurve")
+                if not sw.invoke(curve, "IsCircle"):
+                    continue
+                faces = sw.m0(edge, "GetTwoAdjacentFaces2") or ()
+                feats = [sw.m0(f, "GetFeature") for f in faces if f is not None]
+                feat = next((f for f in feats if f is not None and sw.m0(f, "GetTypeName2") == "HoleWzd"), None)
+                if feat is None or feat.Name in done:
+                    continue
+                drw.ActivateView(view.Name)
+                drw.ClearSelection2(True)
+                if not view.SelectEntity(edge, False):
+                    continue
+                # stack the callout texts beside the view's right edge
+                outline = view.GetOutline()  # xmin, ymin, xmax, ymax on the sheet (m)
+                x = outline[2] + 0.015
+                y = outline[3] - 0.012 * stack
+                if drw.AddHoleCallout2(x, y, 0) is not None:
+                    done[feat.Name] = view.Name
+                    stack += 1
+            except Exception as exc:
+                notes.append(f"{view.Name}: {exc}")
+        view = sw.m0(view, "GetNextView")
+    drw.ClearSelection2(True)
+    out: dict = {"hole_callouts": done}
+    if notes:
+        out["callout_problems"] = notes[:5]
+    return out
+
+
+@tool
+def add_hole_callouts() -> dict:
+    """Add hole callouts (e.g. "2X Ø6.6 ⌴Ø11 ↧6.4") for every Hole Wizard
+    feature to the active drawing."""
+    drw = sw.active_doc(DOC_DRAWING)
+    result = _hole_callouts(drw)
+    drw.ForceRebuild3(False)
+    return result
+
+
 @tool(timeout=300)
-def make_drawing(model_path: str = "", projection: Literal["third_angle", "first_angle"] = "third_angle", import_dimensions: bool = True) -> dict:
-    """Create a drawing with the standard three views (plus model dimensions)
-    of a saved part/assembly; default the active document. Export it as PDF
-    or DXF afterwards with export."""
+def make_drawing(
+    model_path: str = "",
+    projection: Literal["third_angle", "first_angle"] = "third_angle",
+    import_dimensions: bool = True,
+    hole_callouts: bool = True,
+) -> dict:
+    """Create a drawing with the standard three views (plus model dimensions
+    and hole callouts for Hole Wizard holes) of a saved part/assembly;
+    default the active document. Export it as PDF or DXF afterwards with
+    export."""
     app = sw.app()
     if not model_path:
         src = sw.active_doc()
@@ -1065,8 +1122,14 @@ def make_drawing(model_path: str = "", projection: Literal["third_angle", "first
     if import_dimensions:
         # all views, marked-for-drawing dimensions, then rebuild
         drw.InsertModelAnnotations3(0, 32768, True, True, False, False)
+    info = sw.doc_info(drw)
+    if hole_callouts:
+        try:
+            info.update(_hole_callouts(drw))
+        except Exception as exc:
+            info["callout_problems"] = [f"{type(exc).__name__}: {exc}"]
     drw.ForceRebuild3(False)
-    return sw.doc_info(drw)
+    return info
 
 
 # --- Patterns, reference geometry and other features ------------------------
@@ -1555,6 +1618,38 @@ def _wizard_args(kind: str, size: str, through: bool, depth: float, cosmetic: bo
     return (generic, 8, fastener, size, end_type, mm(TAP_DRILL[size]), blind, True) + values + tail
 
 
+def _clearance_variants(size: str, through: bool, depth: float) -> list[tuple[str, tuple]]:
+    """Argument sets that may switch off the near-side countersink SOLIDWORKS
+    adds to clearance holes by default; which one works is not documented,
+    so each is tried and checked on the geometry (no conical face)."""
+    generic, fastener = WIZARD_TYPES["clearance"]
+    drill = mm(CLEARANCE[size])
+    head = (generic, 8, fastener, size, 1 if through else 0, drill, mm(depth) if not through else 0.01, -1)
+    tail = ("", False, True, True, True, True, False)
+    rest = (0, 0, 0, -1, -1, -1, -1, -1)
+    return [
+        ("countersink diameter 0", head + (1, 0, 0, HALF_PI) + rest + tail),
+        ("countersink flag off", head + (0, 0, 0, HALF_PI) + rest + tail),
+        ("countersink = drill", head + (1, 0, drill, HALF_PI) + rest + tail),
+    ]
+
+
+def _has_cone(feat: Any) -> bool:
+    for face in sw.m0(feat, "GetFaces") or ():
+        try:
+            if sw.invoke(sw.m0(face, "GetSurface"), "IsCone"):
+                return True
+        except Exception:
+            continue  # a face whose surface type cannot be read is not a countersink we can see
+    return False
+
+
+def _delete_feature_obj(doc: Any, feat: Any) -> None:
+    doc.ClearSelection2(True)
+    feat.Select2(False, 0)
+    doc.Extension.DeleteSelection2(1)
+
+
 def _select_face_by_ray(doc: Any, face_point: list[float]) -> None:
     """Select the face at face_point the way the Hole Wizard recording does:
     a ray shot onto it from just outside, which also sets the pick point."""
@@ -1570,9 +1665,25 @@ def _select_face_by_ray(doc: Any, face_point: list[float]) -> None:
 
 
 def _hole_wizard(doc: Any, kind: str, size: str, positions: list[list[float]], face_point: list[float],
-                 depth: float, cosmetic: bool, thread_depth: float) -> dict:
-    _select_face_by_ray(doc, face_point)
-    feat = doc.FeatureManager.HoleWizard5(*_wizard_args(kind, size, depth <= 0, depth, cosmetic, thread_depth))
+                 depth: float, cosmetic: bool, thread_depth: float, near_csk: bool = True) -> dict:
+    recorded = _wizard_args(kind, size, depth <= 0, depth, cosmetic, thread_depth)
+    attempts = [("as recorded", recorded)]
+    if kind == "clearance" and not near_csk:
+        attempts = _clearance_variants(size, depth <= 0, depth) + attempts
+    feat, variant = None, None
+    for label, args in attempts:
+        _select_face_by_ray(doc, face_point)
+        try:
+            candidate = doc.FeatureManager.HoleWizard5(*args)
+        except Exception:
+            continue
+        if candidate is None:
+            continue
+        if kind == "clearance" and not near_csk and label != "as recorded" and _has_cone(candidate):
+            _delete_feature_obj(doc, candidate)  # this variant kept the countersink
+            continue
+        feat, variant = candidate, label
+        break
     if feat is None:
         raise RuntimeError("HoleWizard5 returned no feature")
     try:
@@ -1607,7 +1718,12 @@ def _hole_wizard(doc: Any, kind: str, size: str, positions: list[list[float]], f
         feat.Select2(False, 0)
         doc.Extension.DeleteSelection2(1)  # don't leave a half-placed wizard hole behind
         raise
-    return {"features": [feat.Name], "method": "hole_wizard"}
+    result = {"features": [feat.Name], "method": "hole_wizard"}
+    if kind == "clearance":
+        result["near_side_countersink"] = near_csk or variant == "as recorded"
+        if not near_csk:
+            result["countersink_off_by"] = variant if variant != "as recorded" else "none worked; SOLIDWORKS default kept"
+    return result
 
 
 @tool
@@ -1621,6 +1737,7 @@ def hole(
     cosmetic_thread: bool = True,
     thread_depth: float = 0.0,
     wizard: bool = True,
+    near_side_countersink: bool = False,
 ) -> dict:
     """ISO metric holes (M2-M20) at several positions at once, on the face at
     face_point ([x,y,z] mm, e.g. the top face). positions are 2D sketch
@@ -1631,7 +1748,9 @@ def hole(
     By default this is a real Hole Wizard hole, so drawings get hole
     callouts; tapped holes get a cosmetic thread (cosmetic_thread=false for
     the tap drill only) and, when blind, a thread depth (default 75 % of the
-    depth). If the wizard fails, or without face_point, or with
+    depth). Clearance holes come without SOLIDWORKS' default near-side
+    countersink unless near_side_countersink=true. If the wizard fails, or
+    without face_point, or with
     wizard=false, the holes are sketched and cut instead (no callouts);
     "method" in the result says which happened."""
     size = size.upper().replace(" ", "")
@@ -1645,7 +1764,8 @@ def hole(
     if wizard and face_point:
         doc = sw.active_doc(DOC_PART)
         try:
-            info = _hole_wizard(doc, kind, size, positions, face_point, depth, cosmetic_thread, thread_depth)
+            info = _hole_wizard(doc, kind, size, positions, face_point, depth, cosmetic_thread, thread_depth,
+                                near_side_countersink)
             info.update(count=len(positions), drill_mm=TAP_DRILL[size] if kind == "tapped" else CLEARANCE[size])
             if kind == "tapped":
                 info["thread"] = {"cosmetic": cosmetic_thread, "depth_mm": thread_depth if depth > 0 else "through"}
@@ -1845,7 +1965,14 @@ def sweep(
             ("InsertProtrusionSwept4", head + tail + (circular, dia, 0)),
             ("InsertProtrusionSwept3", head + tail),
         ])
-    return _feature_result(feat, "sweep cut" if cut else "sweep")
+    result = _feature_result(feat, "sweep cut" if cut else "sweep")
+    if circular:
+        if thin:
+            outer = circle_diameter if diameter_is == "outer" else circle_diameter + 2 * wall
+            result["tube_mm"] = {"outer_diameter": outer, "inner_diameter": round(outer - 2 * wall, 4), "wall": wall}
+        else:
+            result["diameter_mm"] = circle_diameter
+    return result
 
 
 @tool

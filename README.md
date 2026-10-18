@@ -22,7 +22,7 @@ SOLIDWORKS 2025 SP2 기준으로 작성했습니다.
 | 검사 | `measure`(거리·각도·길이·면적·지름), `check_interference`(어셈블리 간섭), `bom`(부품 수량표) |
 | 기타 | `set_color`, `export_folder`(폴더 일괄 STEP/STL 등 변환) |
 | 어셈블리 | `insert_component`, `list_components`, `add_mate`(일치·동심·거리·각도 등) |
-| 도면 | `make_drawing`(3도 투상, 모델 치수 가져오기) → `export`로 PDF/DXF |
+| 도면 | `make_drawing`(3도 투상, 모델 치수·Hole Wizard 구멍 표기 자동), `add_hole_callouts` → `export`로 PDF/DXF |
 | 만능 | `run_api_script`(SOLIDWORKS API를 Python으로 직접 호출), `run_macro`(.swp 실행) |
 
 모서리나 면은 **그 위의 점 좌표(mm)**로 지정합니다. 예를 들어 50×30×10 박스의 위쪽 앞 모서리는 `[0, 10, 15]`입니다.
