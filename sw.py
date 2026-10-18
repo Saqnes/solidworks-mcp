@@ -374,11 +374,9 @@ def _nearest(entities: Any, point: tuple[float, float, float], where: Callable[[
 TOLERANCE = 0.5 * MM
 
 
-def nearest(doc: Any, entity: str, point_mm: list[float]) -> tuple[float, Any]:
-    """(distance m, entity) of the part's face/edge/vertex nearest a point (mm)."""
-    p = tuple(mm(v) for v in point_mm)
+def _nearest_on_bodies(bodies: Any, entity: str, p: tuple[float, float, float]) -> tuple[float, Any]:
     best: tuple[float, Any] = (math.inf, None)
-    for body in doc.GetBodies2(0, False) or ():
+    for body in bodies or ():
         if entity == "edge":
             cand = _nearest(m0(body, "GetEdges"), p, lambda e: e.GetClosestPointOn(*p))
         elif entity == "face":
@@ -391,16 +389,42 @@ def nearest(doc: Any, entity: str, point_mm: list[float]) -> tuple[float, Any]:
     return best
 
 
+def nearest(doc: Any, entity: str, point_mm: list[float]) -> tuple[float, Any]:
+    """(distance m, entity) of the part's face/edge/vertex nearest a point (mm)."""
+    return _nearest_on_bodies(doc.GetBodies2(0, False), entity, tuple(mm(v) for v in point_mm))
+
+
+def nearest_in_assembly(asm: Any, entity: str, point_mm: list[float]) -> tuple[float, Any]:
+    """Like nearest, over the bodies of every resolved component. Their
+    geometry is in component space, so the point is moved there first; the
+    entities found select in the assembly's context."""
+    mu = m0(app(), "GetMathUtility")
+    best: tuple[float, Any] = (math.inf, None)
+    for comp in asm.GetComponents(False) or ():
+        if m0(comp, "IsSuppressed"):
+            continue
+        try:
+            pt = invoke(mu, "CreatePoint", doubles([mm(v) for v in point_mm]))
+            local = tuple(m0(invoke(pt, "MultiplyTransform", m0(comp.Transform2, "Inverse")), "ArrayData"))[:3]
+            cand = _nearest_on_bodies(comp.GetBodies2(0), entity, local)
+        except Exception:
+            continue  # a lightweight or empty component: nothing to pick there
+        best = min(best, cand, key=lambda c: c[0])
+    return best
+
+
 def select_at(doc: Any, entity: str, point_mm: list[float], append: bool, mark: int = 0) -> None:
     """Select the face/edge/vertex nearest a model-space point (mm).
 
-    In parts this searches the solid bodies directly, so it finds hidden
-    edges too; SelectByID2 only picks what is visible in the current view.
-    Assemblies fall back to SelectByID2."""
+    This searches the solid bodies directly (in assemblies, those of every
+    component), so it finds hidden edges too; SelectByID2, the fallback,
+    only picks what is visible in the current view."""
     entity = entity.lower()
     p = tuple(mm(v) for v in point_mm)
-    if m0(doc, "GetType") == DOC_PART:
-        best = nearest(doc, entity, point_mm)  # solid bodies, hidden ones included
+    kind = m0(doc, "GetType")
+    if kind in (DOC_PART, DOC_ASSEMBLY):
+        finder = nearest if kind == DOC_PART else nearest_in_assembly
+        best = finder(doc, entity, point_mm)  # solid bodies, hidden ones included
         if best[1] is not None and best[0] <= TOLERANCE:
             if not _select_entity(doc, best[1], append, mark):
                 raise RuntimeError(f"Found the {entity} at {point_mm} mm but could not select it")

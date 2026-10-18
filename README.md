@@ -13,20 +13,21 @@ SOLIDWORKS 2025 SP2 기준으로 작성했습니다.
 | 문서 | `status`, `list_documents`, `new_document`, `open_document`, `activate_document`, `save`, `export`, `close_document` |
 | 확인 | `list_features`, `list_dimensions`, `model_info`(질량·부피·무게중심·바운딩박스·재질), `screenshot`(뷰 방향 지정 가능) |
 | 수정 | `set_dimension`, `rebuild`, `undo`, `delete_feature`, `suppress_feature`, `list_materials`, `set_material`, `custom_properties` |
-| 파트 모델링 | `sketch`(선·중심선·사각형·원·호·다각형·슬롯·점·타원·스플라인·글자, 평면 또는 면 위, 설계 의도 치수·대칭 구속 자동), `extrude`(보스/컷, 블라인드·관통·중간평면·구배), `revolve`, `fillet`, `chamfer`, `shell` |
-| 구멍·각인 | `hole`(Hole Wizard: ISO M2~M20 관통·탭·카운터보어·카운터싱크, 여러 위치 한 번에, 나사산 표시), `engrave`(글자 각인·양각) |
+| 파트 모델링 | `sketch`(선·중심선·사각형·원·호·다각형·슬롯·점·타원·스플라인·글자, 평면 또는 면 위, 설계 의도 치수·대칭 구속 자동), `extrude`(보스/컷, 블라인드·관통·중간평면·구배), `revolve`, `fillet`, `chamfer`, `shell`, `draft`(중립면 구배), `dome` |
+| 구멍·각인 | `hole`(Hole Wizard: ISO M2~M20 관통·탭·카운터보어·카운터싱크, 여러 위치 한 번에, 나사산 표시), `cosmetic_thread`(축·구멍에 나사산 표시), `engrave`(글자 각인·양각) |
 | 스윕·로프트 | `sketch3d`(3D 경로), `sweep`(단면 또는 원형 파이프·튜브, 컷 가능), `loft`(가이드 커브, 컷 가능), `rib` |
-| 판금 | `sheet_metal_base_flange`, `flatten`(펼치기/접기), `export_flat_pattern`(전개도 DXF, 벤드 라인 포함) |
-| 패턴·참조 | `linear_pattern`, `circular_pattern`, `mirror`, `offset_plane`, `reference_axis` |
+| 판금 | `sheet_metal_base_flange`, `edge_flange`(모서리 플랜지, 길이·각도 지정), `flatten`(펼치기/접기), `export_flat_pattern`(전개도 DXF, 벤드 라인 포함) |
+| 패턴·참조 | `linear_pattern`, `circular_pattern`, `mirror`, `offset_plane`, `angle_plane`(축을 지나는 각도 평면), `reference_axis` |
 | 설계 변수 | `list_equations`, `set_equation`(전역 변수·치수 연결), `delete_equation`, `configurations` |
 | 검사 | `measure`(거리·각도·길이·면적·지름), `check_interference`(어셈블리 간섭), `bom`(부품 수량표) |
 | 기타 | `set_color`, `export_folder`(폴더 일괄 STEP/STL 등 변환) |
-| 어셈블리 | `insert_component`, `list_components`, `add_mate`(일치·동심·거리·각도 등) |
-| 도면 | `make_drawing`(3도 투상, 모델 치수·Hole Wizard 구멍 표기 자동), `add_hole_callouts` → `export`로 PDF/DXF |
+| 어셈블리 | `insert_component`, `list_components`, `add_mate`(일치·동심·거리·각도 등), `list_mates`, `set_component`(고정/유동·숨기기·억제·이동) |
+| 도면 | `make_drawing`(3도 투상, 모델 치수·Hole Wizard 구멍 표기 자동), `add_hole_callouts`, `list_views`, `drawing_view`(등각 등 모델 뷰), `section_view`(단면도), `detail_view`(상세도), `set_drawing_scale`, `drawing_note`, `center_marks`, `bom_table`, `auto_balloons` → `export`로 PDF/DXF |
 | 만능 | `run_api_script`(SOLIDWORKS API를 Python으로 직접 호출), `run_macro`(.swp 실행) |
 
 모서리나 면은 **그 위의 점 좌표(mm)**로 지정합니다. 예를 들어 50×30×10 박스의 위쪽 앞 모서리는 `[0, 10, 15]`입니다.
-파트에서는 바디를 직접 검색하므로 화면에서 가려진 모서리도 찾습니다(0.5 mm 이내).
+파트와 어셈블리 모두 바디를 직접 검색하므로 화면에서 가려진 모서리도 찾습니다(0.5 mm 이내). 어셈블리에서는 어셈블리 좌표로 지정합니다.
+단면도·상세도는 부모 뷰에서 **모델 좌표**로 위치를 지정하고(예: `section_view([35, 5, 0])`), 새 뷰는 시트의 빈 자리에 자동으로 놓입니다.
 재질 이름은 라이브러리 이름과 정확히 같아야 하므로, 모르면 `list_materials("6061")`처럼 먼저 검색하세요.
 `model_info`의 바운딩박스와 `screenshot`으로 Claude가 좌표를 잡습니다.
 전용 도구가 없는 기능(판금 엣지 플랜지, 구배, 서피스, 용접 구조물 등)은 `run_api_script`로 처리합니다.
