@@ -111,6 +111,15 @@ user in Korean.
     removes them from grey but also drops every model edge from the PDF,
     so drawing PDFs stay in colour; SaveAs with swPDFExportInColor off is
     black but loses Korean text (rule 18).
+23. IModelDocExtension.GetPackAndGo fails from this out-of-process client
+    ("required parameter", early binding too), so pack_and_go copies the
+    files from GetDocumentDependencies2 itself and repoints every copied
+    assembly/drawing with ISldWorks.ReplaceReferencedDocument (works on
+    closed files). Reading references back is no check while the originals
+    are open: SOLIDWORKS then reports the open documents' paths, even with
+    searchflag False. New views keep 30 mm from the sheet edges
+    (`_free_spot` margin) and automatic dimensions flip to the other side
+    of a view when the border would push them onto it (`_beside_view`).
 
 ## Verified on the real SOLIDWORKS
 
@@ -140,16 +149,19 @@ functions, each result checked (volumes, positions, PDFs rendered):
   add_dimension, set_tolerance, hole_table, title_block ("a3 - iso"),
   bom_table, auto_balloons, drawing_sheets, datum, geometric_tolerance,
   surface_finish, revision_table, broken_out_section, auxiliary_view,
-  cut_list_table, weld_symbol, ordinate_dimensions, break_view, export
-  PDF (all sheets, Korean text) and DXF.
+  cut_list_table, weld_symbol, ordinate_dimensions, break_view,
+  dimension_holes, flat_pattern_view, export PDF (all sheets, Korean
+  text) and DXF.
+- Files: edit_sketch, pack_and_go (prefix/suffix, drawings; reopened the
+  packed assembly with the originals closed: every component loads from
+  the copy).
 
 Macro recordings and argument tables: `docs/recordings/HANDOFF.md`.
 
 ## Open items
 
-1. Hole position dimensions in drawings are missing (wizard placement
-   sketch points have no dimensions); add_dimension with entity "center"
-   is the workaround.
+1. Hole positions are not model dimensions (wizard placement sketch points
+   carry none); dimension_holes adds ordinate dimensions in the drawing.
 2. Weldments: the cut list table's description column ("비고") stays empty
    with the Korean template (the cut list property is "설명").
 3. Not rechecked on the real SOLIDWORKS: revolve, chamfer,

@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import glob
 import io
 import math
 import os
 import re
+import shutil
 import tempfile
 import time
 import traceback
@@ -1383,7 +1385,7 @@ def _sheet_size(drw: Any) -> tuple[float, float]:
 
 def _free_spot(drw: Any, width: float, height: float, exclude: str = "",
                near: tuple[float, float] | None = None, axis: str = "",
-               extra: list | None = None, margin: float = 0.01) -> tuple[float, float]:
+               extra: list | None = None, margin: float = 0.03) -> tuple[float, float]:
     """Centre (m) of a free area of the given size on the sheet, clear of the
     views (and their annotations) by a gap; the free spot closest to `near`
     (default the sheet's top right). axis "x" keeps near's y (search along
@@ -2046,11 +2048,8 @@ def add_dimension(
         x1, y1, x2, y2 = sw.m0(target, "GetOutline")
         side = "left" if direction == "vertical" else "top"
         stack = 0.008 + 0.007 * _dimension_count(target, side)  # one row further out per dimension there
-        x = sum(p[0] for p in pts) / len(pts)
-        y = y2 + stack
-        if direction == "vertical":
-            x, y = x1 - stack, sum(p[1] for p in pts) / len(pts)
-        x, y = _inside_border(drw, x, y)
+        along = sum(p[1] for p in pts) / len(pts) if direction == "vertical" else sum(p[0] for p in pts) / len(pts)
+        x, y = _beside_view(drw, target, side, stack, along)
     add = {"aligned": "AddDimension2", "horizontal": "AddHorizontalDimension2", "vertical": "AddVerticalDimension2"}[direction]
     app = sw.app()
     prompt = app.GetUserPreferenceToggle(INPUT_DIM_ON_CREATE)
@@ -2090,6 +2089,24 @@ BORDER = 0.02  # m kept clear along the sheet edges (the sheet format's frame an
 def _inside_border(drw: Any, x: float, y: float) -> tuple[float, float]:
     sheet_w, sheet_h = _sheet_size(drw)
     return min(max(x, BORDER), sheet_w - BORDER), min(max(y, BORDER), sheet_h - BORDER)
+
+
+def _beside_view(drw: Any, view: Any, side: str, distance: float, along: float) -> tuple[float, float]:
+    """A sheet point `distance` beyond one side ("top"/"bottom"/"left"/
+    "right") of a view's outline, at `along` (x for top/bottom, y for
+    left/right). When the sheet border would push it back onto the view,
+    the opposite side is used instead."""
+    x1, y1, x2, y2 = sw.m0(view, "GetOutline")
+    flip = {"top": "bottom", "bottom": "top", "left": "right", "right": "left"}
+    for s in (side, flip[side]):
+        spot = {"top": (along, y2 + distance), "bottom": (along, y1 - distance),
+                "left": (x1 - distance, along), "right": (x2 + distance, along)}[s]
+        x, y = _inside_border(drw, *spot)
+        clear = {"top": y > y2, "bottom": y < y1, "left": x < x1, "right": x > x2}[s]
+        if clear:
+            return x, y
+    return _inside_border(drw, *{"top": (along, y2 + distance), "bottom": (along, y1 - distance),
+                                 "left": (x1 - distance, along), "right": (x2 + distance, along)}[side])
 
 
 @tool
@@ -2505,9 +2522,9 @@ def ordinate_dimensions(
     if position:
         x, y = mm(position[0]), mm(position[1])
     elif direction == "horizontal":
-        x, y = (x1 + x2) / 2, y2 + 0.01 + 0.007 * _dimension_count(target)
+        x, y = _beside_view(drw, target, "top", 0.01 + 0.007 * _dimension_count(target, "top"), (x1 + x2) / 2)
     else:
-        x, y = x1 - 0.01 - 0.007 * _dimension_count(target), (y1 + y2) / 2
+        x, y = _beside_view(drw, target, "left", 0.01 + 0.007 * _dimension_count(target, "left"), (y1 + y2) / 2)
     kind = sw.constant("swHorizontalOrdinate" if direction == "horizontal" else "swVerticalOrdinate")
     app = sw.app()
     prompt = app.GetUserPreferenceToggle(INPUT_DIM_ON_CREATE)
@@ -2553,6 +2570,179 @@ def break_view(start: float, end: float, axis: Literal["x", "y", "z"] = "x", vie
     drw.ClearSelection2(True)
     drw.ForceRebuild3(False)
     return {"view": target.Name, "removed_mm": abs(end - start), "axis": axis, "style": style}
+
+
+def _edge_ends(edge: Any) -> tuple[tuple, tuple] | None:
+    """Model start and end points (m) of an edge, from its curve parameters."""
+    try:
+        p = sw.m0(edge, "GetCurveParams2")
+        return tuple(p[0:3]), tuple(p[3:6])
+    except Exception:
+        return None
+
+
+def _full_circles(view: Any) -> list[tuple[Any, tuple[float, float]]]:
+    """(edge, sheet centre) of each hole seen in a view: full circles only
+    (fillet arcs are skipped), one per centre (both faces of a plate show
+    the same circle)."""
+    out: list = []
+    for edge in view.GetVisibleEntities2(sw.nothing(), sw.constant("swViewEntityType_Edge")) or ():
+        try:
+            curve = sw.m0(edge, "GetCurve")
+            if not sw.invoke(curve, "IsCircle"):
+                continue
+            params = sw.m0(edge, "GetCurveParams2")
+            if abs(abs(params[7] - params[6]) - 2 * math.pi) > 1e-3:  # start/end parameter: a partial arc
+                continue
+            centre = _to_sheet(view, [c / MM for c in curve.CircleParams[:3]])
+        except Exception:
+            continue
+        if all(math.dist(centre, c) > 1e-4 for _, c in out):
+            out.append((edge, centre))
+    return out
+
+
+def _lower_left_vertex(view: Any) -> Any:
+    best, key = None, math.inf
+    for vx in view.GetVisibleEntities2(sw.nothing(), sw.constant("swViewEntityType_Vertex")) or ():
+        x, y = _to_sheet(view, [c / MM for c in _vertex_point(view, vx)])
+        if x + y < key:
+            best, key = vx, x + y
+    return best
+
+
+def _ordinate(drw: Any, view: Any, origin: Any, ents: list, direction: str, x: float, y: float) -> int:
+    drw.ActivateView(view.Name)
+    drw.ClearSelection2(True)
+    _view_pick(drw, view, origin, 0, False)
+    for ent in ents:
+        _view_pick(drw, view, ent, 0, True)
+    before = _dimension_count(view)
+    kind = sw.constant("swHorizontalOrdinate" if direction == "horizontal" else "swVerticalOrdinate")
+    app = sw.app()
+    prompt = app.GetUserPreferenceToggle(INPUT_DIM_ON_CREATE)
+    app.SetUserPreferenceToggle(INPUT_DIM_ON_CREATE, False)
+    try:
+        drw.AddOrdinateDimension2(kind, x, y, 0)
+    finally:
+        app.SetUserPreferenceToggle(INPUT_DIM_ON_CREATE, prompt)
+    drw.ClearSelection2(True)
+    return _dimension_count(view) - before
+
+
+@tool
+def dimension_holes(view: str = "") -> dict:
+    """Position every hole seen in a drawing view (default the first view
+    that shows holes face on) with ordinate dimensions from the view's lower
+    left corner: one horizontal row above the view and one vertical row to
+    its left, each hole centre once (holes sharing an x or y share it)."""
+    drw = sw.active_doc(DOC_DRAWING)
+    views = [_drawing_view(drw, view)] if view else _drawing_views(drw)
+    target, holes = None, []
+    for v in views:
+        holes = _full_circles(v)
+        if holes:
+            target = v
+            break
+    if target is None:
+        raise LookupError("No view shows holes as circles" + (f" ({view})" if view else ""))
+    origin = _lower_left_vertex(target)
+    if origin is None:
+        raise LookupError(f"No corner in {target.Name} to measure from")
+
+    def distinct(axis: int) -> list:
+        picked, seen = [], []
+        for edge, c in sorted(holes, key=lambda h: h[1][axis]):
+            if all(abs(c[axis] - s) > 1e-4 for s in seen):
+                picked.append(edge)
+                seen.append(c[axis])
+        return picked
+
+    x1, y1, x2, y2 = sw.m0(target, "GetOutline")
+    across = _ordinate(drw, target, origin, distinct(0), "horizontal",
+                       *_beside_view(drw, target, "top", 0.012, (x1 + x2) / 2))
+    up = _ordinate(drw, target, origin, distinct(1), "vertical",
+                   *_beside_view(drw, target, "left", 0.012, (y1 + y2) / 2))
+    drw.ForceRebuild3(False)
+    return {"view": target.Name, "holes": len(holes), "horizontal_dimensions": across, "vertical_dimensions": up}
+
+
+@tool
+def flat_pattern_view(position: list[float] | None = None, scale: str = "", hide_bend_lines: bool = False,
+                      flip: bool = False, dimension: bool = True, model_path: str = "") -> dict:
+    """Add the flat pattern of a sheet metal part (the one the drawing
+    shows, or model_path) as a drawing view, with bend lines unless
+    hide_bend_lines. dimension adds the overall flat width and height.
+    position is the view centre on the sheet (mm), default a free spot."""
+    drw = sw.active_doc(DOC_DRAWING)
+    views = _drawing_views(drw)
+    if not model_path:
+        if not views:
+            raise ValueError("The drawing has no views yet; pass model_path")
+        model_path = sw.m0(views[0], "GetReferencedModelName")
+    config = views[0].ReferencedConfiguration if views else ""
+    sheet_w, sheet_h = _sheet_size(drw)
+    x, y = (mm(position[0]), mm(position[1])) if position else (sheet_w / 2, sheet_h / 2)
+    new = _call_first(drw, [
+        ("CreateFlatPatternViewFromModelView3", (model_path, config, x, y, 0, hide_bend_lines, flip)),
+        ("CreateFlatPatternViewFromModelView2", (model_path, config, x, y, 0, hide_bend_lines)),
+    ])
+    if new is None:
+        raise RuntimeError("Could not create a flat pattern view; is the model a sheet metal part?")
+    if scale:
+        _set_view_scale(new, scale)
+    drw.ForceRebuild3(False)
+    if not position:
+        a1, b1, a2, b2 = sw.m0(new, "GetOutline")
+        new.Position = sw.doubles(_free_spot(drw, a2 - a1, b2 - b1, exclude=new.Name, extra=_table_boxes(drw)))
+        drw.ForceRebuild3(False)
+    result = _view_info(new)
+    if dimension:
+        result["dimensions"] = _overall_dimensions(drw, new)
+    return result
+
+
+def _overall_dimensions(drw: Any, view: Any) -> dict:
+    """Overall width and height of what a view shows, between its outermost
+    straight edges."""
+    lines = []
+    for edge in view.GetVisibleEntities2(sw.nothing(), sw.constant("swViewEntityType_Edge")) or ():
+        try:
+            if not sw.invoke(sw.m0(edge, "GetCurve"), "IsLine"):
+                continue
+            ends = _edge_ends(edge)
+            if ends is None:
+                continue
+            a, b = (_to_sheet(view, [c / MM for c in p]) for p in ends)
+        except Exception:
+            continue
+        lines.append((edge, a, b))
+    out = {}
+    x1, y1, x2, y2 = sw.m0(view, "GetOutline")
+    for axis, direction, add in ((0, "horizontal", "AddHorizontalDimension2"), (1, "vertical", "AddVerticalDimension2")):
+        # edges running across this axis: the two lying furthest apart along it
+        across = [l for l in lines if abs(l[1][axis] - l[2][axis]) < 1e-5]
+        if len(across) < 2:
+            continue
+        low = min(across, key=lambda l: l[1][axis])
+        high = max(across, key=lambda l: l[1][axis])
+        drw.ActivateView(view.Name)
+        drw.ClearSelection2(True)
+        _view_pick(drw, view, low[0], 0, False)
+        _view_pick(drw, view, high[0], 0, True)
+        px, py = (_beside_view(drw, view, "top", 0.01, (x1 + x2) / 2) if axis == 0
+                  else _beside_view(drw, view, "left", 0.01, (y1 + y2) / 2))
+        app = sw.app()
+        prompt = app.GetUserPreferenceToggle(INPUT_DIM_ON_CREATE)
+        app.SetUserPreferenceToggle(INPUT_DIM_ON_CREATE, False)
+        try:
+            dim = getattr(drw, add)(px, py, 0)
+        finally:
+            app.SetUserPreferenceToggle(INPUT_DIM_ON_CREATE, prompt)
+        drw.ClearSelection2(True)
+        if dim is not None:
+            out[direction] = round(dim.GetDimension2(0).Value, 3)
+    return out
 
 
 # --- Patterns, reference geometry and other features ------------------------
@@ -3069,6 +3259,38 @@ def face_fillet(face1_point: list[float], face2_point: list[float], radius: floa
     return _feature_result(feat, "face fillet")
 
 
+@tool
+def edit_sketch(sketch_name: str, entities: list[dict]) -> dict:
+    """Add entities to an existing sketch (name from list_features), in its
+    own 2D coordinates (mm), with the same entity types as sketch(). The
+    features built on the sketch update; e.g. add a circle to a plate's
+    sketch to cut another hole in the same extrude."""
+    doc = sw.active_doc(DOC_PART)
+    feat = sw.feature(doc, sketch_name)
+    sw.close_open_sketch(doc)
+    doc.ClearSelection2(True)
+    feat.Select2(False, 0)
+    sw.m0(doc, "EditSketch")
+    sm = doc.SketchManager
+    if sm.ActiveSketch is None:
+        raise RuntimeError(f"Could not open {sketch_name} for editing")
+    failed = []
+    sm.AddToDB = True
+    try:
+        for i, e in enumerate(entities):
+            if _sketch_entity(sm, e, doc) is None:
+                failed.append(i)
+    finally:
+        sm.AddToDB = False
+        doc.ClearSelection2(True)
+        sm.InsertSketch(True)  # leave the sketch; the model rebuilds
+    _rebuild(doc)
+    result = {"sketch": feat.Name, "added": len(entities) - len(failed)}
+    if failed:
+        result["failed_entities"] = failed
+    return result
+
+
 # --- Equations, global variables and configurations -------------------------
 
 
@@ -3320,6 +3542,74 @@ def export_folder(folder: str, extension: str = "step", recursive: bool = False,
     if previous is not None:
         app.ActivateDoc3(sw.m0(previous, "GetTitle"), False, 0, sw.out_int())
     return results
+
+
+def _dependencies(path: str, traverse: bool = True, search: bool = True) -> list[str]:
+    """Files a SOLIDWORKS document references (paths), all levels with
+    traverse. search=True resolves them the way opening would (documents
+    already open win); False gives the paths stored in the file."""
+    pairs = sw.app().GetDocumentDependencies2(path, traverse, search, False) or ()
+    return [pairs[i + 1] for i in range(0, len(pairs) - 1, 2)]
+
+
+@tool(timeout=600)
+def pack_and_go(folder: str, prefix: str = "", suffix: str = "", include_drawings: bool = True) -> dict:
+    """Copy the active part/assembly (saved) with every file it references
+    into `folder`, optionally renamed with a prefix/suffix, plus the
+    drawings next to those files that show them: to hand a design to
+    someone else. The copies reference each other only, never the
+    originals; the open documents keep pointing at the originals. Unsaved
+    changes are not included (save first)."""
+    doc = sw.active_doc()
+    if sw.m0(doc, "GetType") == DOC_DRAWING:
+        raise ValueError("Activate the part or assembly; its drawings come along with include_drawings")
+    root = sw.m0(doc, "GetPathName")
+    if not root:
+        raise ValueError("Save the document first")
+    target = os.path.abspath(folder)
+    files = [root] + [f for f in _dependencies(root) if f.lower() != root.lower()]
+    files = list(dict.fromkeys(os.path.normpath(f) for f in files if os.path.exists(f)))
+    if include_drawings:
+        wanted = {f.lower() for f in files}
+        for d in sorted({os.path.dirname(f) for f in files}):
+            for drw in glob.glob(os.path.join(d, "*.slddrw")):
+                if any(f.lower() in wanted for f in _dependencies(drw, traverse=False)):
+                    files.append(os.path.normpath(drw))
+    mapping: dict[str, str] = {}
+    for f in files:
+        stem, ext = os.path.splitext(os.path.basename(f))
+        new = os.path.join(target, f"{prefix}{stem}{suffix}{ext}")
+        if any(v.lower() == new.lower() for v in mapping.values()):
+            raise ValueError(f"Two referenced files would both become {os.path.basename(new)}; use a prefix or rename one")
+        mapping[f] = new
+    clash = [v for v in mapping.values() if os.path.exists(v)]
+    if clash:
+        raise FileExistsError(f"{len(clash)} files already exist in {target} (e.g. {os.path.basename(clash[0])}); choose an empty folder")
+    os.makedirs(target, exist_ok=True)
+    for old, new in mapping.items():
+        shutil.copy2(old, new)
+    # point every copied assembly/drawing at the copies (works on closed files)
+    app = sw.app()
+    lower = {k.lower(): v for k, v in mapping.items()}
+    repointed, problems = 0, []
+    for old, new in mapping.items():
+        if not old.lower().endswith((".sldasm", ".slddrw")):
+            continue
+        for ref in _dependencies(new, traverse=False, search=False):
+            dest = lower.get(os.path.normpath(ref).lower())
+            if dest and os.path.normcase(dest) != os.path.normcase(ref):
+                if app.ReplaceReferencedDocument(new, ref, dest):
+                    repointed += 1
+                else:
+                    problems.append(f"{os.path.basename(new)} -> {os.path.basename(ref)}")
+    # (reading the copies' references back is no check: while the originals are
+    # open, SOLIDWORKS reports the open documents' paths even for stored ones)
+    result = {"folder": target, "files": [os.path.basename(v) for v in mapping.values()], "references_updated": repointed}
+    if sw.m0(doc, "GetSaveFlag"):
+        result["warning"] = "the active document has unsaved changes; the copy holds the saved version"
+    if problems:
+        result["problems"] = [f"could not repoint {p}" for p in problems]
+    return result
 
 
 # --- Holes (ISO metric) -------------------------------------------------------
