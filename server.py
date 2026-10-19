@@ -302,8 +302,11 @@ def list_features(include_hidden: bool = False) -> list[dict]:
 
 
 def _dim_value(dim: Any) -> tuple[float, str]:
-    if sw.m0(dim, "GetType") == 2:  # swDimensionParamTypeDoubleAngular
+    kind = sw.m0(dim, "GetType")  # swDimensionParamType_e: 0 linear, 1 angular, 2 integer (e.g. pattern counts)
+    if kind == sw.constant("swDimensionParamTypeDoubleAngular"):
         return round(math.degrees(dim.SystemValue), 6), "deg"
+    if kind == sw.constant("swDimensionParamTypeInteger"):
+        return round(dim.SystemValue, 6), ""
     return round(dim.SystemValue / MM, 6), "mm"
 
 
@@ -421,7 +424,13 @@ def set_dimension(name: str, value: float, configurations: Literal["this", "all"
     dim = doc.Parameter(name)
     if dim is None:
         raise LookupError(f"No dimension {name!r}; use list_dimensions")
-    system = deg(value) if sw.m0(dim, "GetType") == 2 else mm(value)
+    kind = sw.m0(dim, "GetType")
+    if kind == sw.constant("swDimensionParamTypeDoubleAngular"):
+        system = deg(value)
+    elif kind == sw.constant("swDimensionParamTypeInteger"):
+        system = float(round(value))  # counts, e.g. pattern instances
+    else:
+        system = mm(value)
     which = 1 if configurations == "this" else 2  # swSetValue_InThisConfiguration / _InAllConfigurations
     status = _call_first(dim, [
         ("SetSystemValue3", (system, which, sw.nothing())),
@@ -2029,11 +2038,13 @@ def add_dimension(
     else:  # above the midpoint of what is measured, outside the view
         pts = [_to_sheet(target, point1)] + ([_to_sheet(target, point2)] if point2 else [])
         x1, y1, x2, y2 = sw.m0(target, "GetOutline")
-        stack = 0.008 + 0.007 * _dimension_count(target)  # one row further out per dimension
+        side = "left" if direction == "vertical" else "top"
+        stack = 0.008 + 0.007 * _dimension_count(target, side)  # one row further out per dimension there
         x = sum(p[0] for p in pts) / len(pts)
         y = y2 + stack
         if direction == "vertical":
             x, y = x1 - stack, sum(p[1] for p in pts) / len(pts)
+        x, y = _inside_border(drw, x, y)
     add = {"aligned": "AddDimension2", "horizontal": "AddHorizontalDimension2", "vertical": "AddVerticalDimension2"}[direction]
     app = sw.app()
     prompt = app.GetUserPreferenceToggle(INPUT_DIM_ON_CREATE)
@@ -2049,12 +2060,30 @@ def add_dimension(
     return {"dimension": "@".join(d.FullName.split("@")[:2]), "value_mm": round(d.Value, 4), "view": target.Name}
 
 
-def _dimension_count(view: Any) -> int:
+def _dimension_count(view: Any, side: str = "") -> int:
+    """Dimensions shown in a view; with side ("top"/"left"/...), only those
+    whose text sits beyond that side of the view's outline."""
+    x1, y1, x2, y2 = sw.m0(view, "GetOutline")
     n, dd = 0, sw.m0(view, "GetFirstDisplayDimension5")
     while dd is not None:
-        n += 1
+        if not side:
+            n += 1
+        else:
+            try:
+                tx, ty = list(sw.m0(sw.m0(dd, "GetAnnotation"), "GetPosition"))[:2]
+            except Exception:
+                tx, ty = (x1 + x2) / 2, (y1 + y2) / 2
+            n += {"top": ty > y2, "bottom": ty < y1, "left": tx < x1, "right": tx > x2}[side]
         dd = sw.m0(dd, "GetNext5")
     return n
+
+
+BORDER = 0.02  # m kept clear along the sheet edges (the sheet format's frame and zone labels)
+
+
+def _inside_border(drw: Any, x: float, y: float) -> tuple[float, float]:
+    sheet_w, sheet_h = _sheet_size(drw)
+    return min(max(x, BORDER), sheet_w - BORDER), min(max(y, BORDER), sheet_h - BORDER)
 
 
 @tool
@@ -2128,10 +2157,16 @@ def _annotation_spot(view: Any, point_mm: list[float], distance: float = 0.012) 
     n = 0
     ann = sw.m0(view, "GetFirstAnnotation3")
     while ann is not None:
-        n += 1
+        if sw.m0(ann, "GetType") != 4:  # symbols, not dimensions
+            try:
+                ax, ay = list(sw.m0(ann, "GetPosition"))[:2]
+                n += {"left": ax < x1, "right": ax > x2, "bottom": ay < y1, "top": ay > y2}[side]
+            except Exception:
+                pass
         ann = sw.m0(ann, "GetNext3")
-    d = distance + 0.004 * (n % 4)  # stagger so consecutive symbols do not sit on each other
-    return {"left": (x1 - d, py), "right": (x2 + d, py), "bottom": (px, y1 - d), "top": (px, y2 + d)}[side]
+    d = distance + 0.006 * (n % 4)  # stagger so symbols on the same side do not sit on each other
+    spot = {"left": (x1 - d, py), "right": (x2 + d, py), "bottom": (px, y1 - d), "top": (px, y2 + d)}[side]
+    return _inside_border(sw.active_doc(DOC_DRAWING), *spot)
 
 
 def _attach(drw: Any, view: Any, point: list[float], entity: str) -> None:

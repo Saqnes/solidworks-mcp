@@ -93,6 +93,11 @@ user in Korean.
     rejects every argument form, so SOLIDWORKS keeps the origin side, and a
     bend on an already bent flange is refused. IModelDoc2.
     InsertSheetMetalJog created nothing in 48 argument/selection variants.
+21. IDimension.GetType is swDimensionParamType_e: 0 linear, 1 angular,
+    2 integer (pattern counts). It used to be read as "2 = angular", so
+    angles came out as mm and counts as degrees, in list_dimensions and
+    set_dimension. Automatic annotation positions stay 20 mm inside the
+    sheet edges (`_inside_border`) and stack per side of the view.
 
 ## Verified on the real SOLIDWORKS
 
