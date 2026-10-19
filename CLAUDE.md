@@ -98,6 +98,12 @@ user in Korean.
     angles came out as mm and counts as degrees, in list_dimensions and
     set_dimension. Automatic annotation positions stay 20 mm inside the
     sheet edges (`_inside_border`) and stack per side of the view.
+22. Grey dimensions/callouts in drawing PDFs are SOLIDWORKS' colour for
+    driven (reference) annotations (swSystemColorsImportedDrivenAnnotation
+    = 0x808080). Printing with PageSetup.DrawingColor = black and white
+    removes them from grey but also drops every model edge from the PDF,
+    so drawing PDFs stay in colour; SaveAs with swPDFExportInColor off is
+    black but loses Korean text (rule 18).
 
 ## Verified on the real SOLIDWORKS
 
