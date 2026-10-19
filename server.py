@@ -1772,10 +1772,10 @@ def hole_table(
     vertices = list(target.GetVisibleEntities2(sw.nothing(), vk) or ())
     if origin_point:
         p = tuple(mm(c) for c in origin_point)
-        origin = min(vertices, key=lambda vx: math.dist(p, tuple(sw.m0(vx, "GetPoint"))), default=None)
+        origin = min(vertices, key=lambda vx: math.dist(p, _vertex_point(target, vx, p)), default=None)
     else:  # lower left on the sheet
         def sheet_xy(vx):
-            x, y = _to_sheet(target, [c / MM for c in sw.m0(vx, "GetPoint")])
+            x, y = _to_sheet(target, [c / MM for c in _vertex_point(target, vx)])
             return x + y
         origin = min(vertices, key=sheet_xy, default=None)
     if origin is None:
@@ -1958,6 +1958,19 @@ def set_tolerance(
     return out
 
 
+def _vertex_point(view: Any, vertex: Any, near: tuple | None = None) -> tuple:
+    """Model point (m) of a vertex from a view's visible entities. Those
+    report the model point shifted by the view's sheet position (edges do
+    not), so the shift is taken off; with `near`, whichever reading is
+    closer wins in case a release reports it plainly."""
+    raw = tuple(sw.m0(vertex, "GetPoint")[:3])
+    px, py = view.Position
+    fixed = (raw[0] - px, raw[1] - py, raw[2])
+    if near is None:
+        return fixed
+    return min((fixed, raw), key=lambda q: math.dist(q, near))
+
+
 def _view_entity(view: Any, point_mm: list[float], kind: str) -> Any:
     """The edge or vertex shown in a view that is nearest a model point;
     kind "center" is the circular edge whose centre is nearest (a hole)."""
@@ -1967,7 +1980,7 @@ def _view_entity(view: Any, point_mm: list[float], kind: str) -> Any:
     for ent in view.GetVisibleEntities2(sw.nothing(), types["edge" if kind == "center" else kind]) or ():
         try:
             if kind == "vertex":
-                q = sw.m0(ent, "GetPoint")
+                q = _vertex_point(view, ent, p)
             elif kind == "center":
                 curve = sw.m0(ent, "GetCurve")
                 if not sw.invoke(curve, "IsCircle"):
@@ -2384,6 +2397,121 @@ def cut_list_table(view: str = "", position: list[float] | None = None) -> dict:
     except Exception:
         rows = None
     return {"rows": rows, "top_left_mm": corner}
+
+
+WELD_SYMBOLS = {"fillet": "FILL", "butt": "BUTT", "square": "BUSQ", "v": "BUSV", "bevel": "BUSB", "u": "BUSU",
+                "j": "BUSJ", "plug": "PLUG", "spot": "SPOT", "seam": "SEAM", "backing": "BACK"}
+
+
+@tool
+def weld_symbol(
+    point: list[float],
+    symbol: Literal["fillet", "butt", "square", "v", "bevel", "u", "j", "plug", "spot", "seam", "backing"] = "fillet",
+    size: str = "",
+    length: str = "",
+    other_side: bool = False,
+    all_around: bool = False,
+    field_weld: bool = False,
+    view: str = "",
+    position: list[float] | None = None,
+) -> dict:
+    """ISO weld symbol pointing at the model edge through `point` ([x,y,z]
+    mm) in a drawing view (default the first): symbol type, size (e.g. "5"
+    for a 5 mm fillet, left of the symbol) and length/pitch (right of it),
+    on the arrow side or the other side; all_around draws the circle,
+    field_weld the flag."""
+    drw = sw.active_doc(DOC_DRAWING)
+    target = _drawing_view(drw, view)
+    _attach(drw, target, point, "edge")
+    ws = sw.invoke(drw, "InsertWeldSymbol3")
+    drw.ClearSelection2(True)
+    if ws is None:
+        raise RuntimeError("SOLIDWORKS did not insert the weld symbol")
+    # SetText(arrow side?, left text, symbol code, right text, stagger, contour)
+    ws.SetText(not other_side, size, f"<WELD-{WELD_SYMBOLS[symbol]}>", length, "", 0)
+    if all_around:
+        ws.SetPeripheral(True)
+    if field_weld:
+        ws.SetFieldWeld(True)
+    at = _place(sw.m0(ws, "GetAnnotation"), target, point, position)
+    sw.m0(drw, "GraphicsRedraw2")
+    return {"symbol": symbol, "size": size, "length": length, "view": target.Name, "position_mm": at}
+
+
+@tool
+def ordinate_dimensions(
+    points: list[list[float]],
+    direction: Literal["horizontal", "vertical"] = "horizontal",
+    entity: Literal["vertex", "edge", "center"] = "vertex",
+    view: str = "",
+    position: list[float] | None = None,
+) -> dict:
+    """Ordinate (baseline) dimensions in a drawing view (default the
+    first): the first model point ([x,y,z] mm) is the zero, the others get
+    their distance from it, all along one line. entity picks vertices,
+    edges or hole centres at the points. position is where the dimension
+    line sits on the sheet (mm), default just outside the view."""
+    if len(points) < 2:
+        raise ValueError("Give the zero point and at least one more")
+    drw = sw.active_doc(DOC_DRAWING)
+    target = _drawing_view(drw, view)
+    ents = [_view_entity(target, p, entity) for p in points]
+    drw.ActivateView(target.Name)
+    drw.ClearSelection2(True)
+    for i, ent in enumerate(ents):
+        _view_pick(drw, target, ent, 0, i > 0)
+    x1, y1, x2, y2 = sw.m0(target, "GetOutline")
+    if position:
+        x, y = mm(position[0]), mm(position[1])
+    elif direction == "horizontal":
+        x, y = (x1 + x2) / 2, y2 + 0.01 + 0.007 * _dimension_count(target)
+    else:
+        x, y = x1 - 0.01 - 0.007 * _dimension_count(target), (y1 + y2) / 2
+    kind = sw.constant("swHorizontalOrdinate" if direction == "horizontal" else "swVerticalOrdinate")
+    app = sw.app()
+    prompt = app.GetUserPreferenceToggle(INPUT_DIM_ON_CREATE)
+    app.SetUserPreferenceToggle(INPUT_DIM_ON_CREATE, False)
+    try:
+        before = _dimension_count(target)
+        drw.AddOrdinateDimension2(kind, x, y, 0)
+    finally:
+        app.SetUserPreferenceToggle(INPUT_DIM_ON_CREATE, prompt)
+    drw.ClearSelection2(True)
+    made = _dimension_count(target) - before
+    if made <= 0:
+        raise RuntimeError("SOLIDWORKS added no ordinate dimensions; check the picked geometry")
+    return {"view": target.Name, "dimensions": made, "direction": direction}
+
+
+@tool
+def break_view(start: float, end: float, axis: Literal["x", "y", "z"] = "x", view: str = "",
+               style: Literal["straight", "zigzag", "curve", "small_zigzag", "jagged"] = "zigzag") -> dict:
+    """Shorten a long part in a drawing view (default the first): the stretch
+    between model coordinates start and end (mm) along `axis` is cut out and
+    the ends are drawn with break lines; dimensions still show true length."""
+    drw = sw.active_doc(DOC_DRAWING)
+    target = _drawing_view(drw, view)
+    k = "xyz".index(axis)
+    p1, p2 = [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+    p1[k], p2[k] = start, end
+    a, b = _to_sheet(target, p1), _to_sheet(target, p2)
+    cx, cy = target.Position
+    # break lines across the direction the axis runs on the sheet; positions relative to the view centre
+    horizontal_run = abs(b[0] - a[0]) >= abs(b[1] - a[1])
+    orient = 2 if horizontal_run else 1  # swBreakLineVertical / swBreakLineHorizontal
+    pos = (a[0] - cx, b[0] - cx) if horizontal_run else (a[1] - cy, b[1] - cy)
+    kinds = {"straight": 1, "zigzag": 2, "curve": 3, "small_zigzag": 4, "jagged": 5}  # swBreakLineStyle_e
+    drw.ClearSelection2(True)
+    drw.ActivateView(target.Name)
+    line = target.InsertBreak3(orient, min(pos), max(pos), kinds[style], 0, False)
+    if line is None:
+        raise RuntimeError("SOLIDWORKS did not place the break lines; are start/end inside the part?")
+    drw.ClearSelection2(True)
+    drw.Extension.SelectByID2(target.Name, "DRAWINGVIEW", 0, 0, 0, False, 0, sw.nothing(), 0)
+    sw.invoke(drw, "BreakView")
+    drw.ClearSelection2(True)
+    drw.ForceRebuild3(False)
+    return {"view": target.Name, "removed_mm": abs(end - start), "axis": axis, "style": style}
 
 
 # --- Patterns, reference geometry and other features ------------------------
@@ -2863,6 +2991,41 @@ def face_color(face_points: list[list[float]], rgb: list[int]) -> dict:
             done += 1
     sw.m0(doc, "GraphicsRedraw2")
     return {"faces_coloured": done, "rgb": list(rgb)}
+
+
+@tool
+def variable_fillet(edge_point: list[float], start_radius: float, end_radius: float) -> dict:
+    """Variable-radius fillet on the edge through edge_point ([x,y,z] mm),
+    growing from start_radius at one end of the edge to end_radius at the
+    other (mm)."""
+    import pythoncom
+    from win32com.client import VARIANT
+
+    doc = sw.active_doc(DOC_PART)
+    doc.ClearSelection2(True)
+    sw.select_at(doc, "EDGE", edge_point, False, 1)
+    e = sw.empty
+    radii = VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, [mm(start_radius), mm(end_radius)])  # per vertex
+    before = sw.m0(doc, "GetMassProperties")
+    feat = doc.FeatureManager.FeatureFillet3(195, mm(start_radius), 0, 0, 1, 0, 0, radii, e(), e(), e(), e(), e(), e())
+    result = _feature_result(feat, "variable fillet")
+    after = sw.m0(doc, "GetMassProperties")
+    if before and after:
+        result["volume_removed_mm3"] = round((before[3] - after[3]) / MM**3, 2)
+    return result
+
+
+@tool
+def face_fillet(face1_point: list[float], face2_point: list[float], radius: float) -> dict:
+    """Face fillet of `radius` mm blending two faces (points on each,
+    [x,y,z] mm); unlike an edge fillet the faces need not share an edge."""
+    doc = sw.active_doc(DOC_PART)
+    doc.ClearSelection2(True)
+    sw.select_at(doc, "FACE", face1_point, False, 0)
+    sw.select_at(doc, "FACE", face2_point, True, 0)
+    e = sw.empty
+    feat = doc.FeatureManager.FeatureFillet3(195, mm(radius), 0, 0, 2, 0, 0, e(), e(), e(), e(), e(), e(), e())  # face fillet
+    return _feature_result(feat, "face fillet")
 
 
 # --- Equations, global variables and configurations -------------------------
@@ -4097,6 +4260,70 @@ def cut_list() -> list[dict]:
     return out
 
 
+def _line_sketch_on_face(doc: Any, face: Any, p1: tuple, p2: tuple) -> Any:
+    """A sketch on `face` holding one line between two model points (m)."""
+    sw.close_open_sketch(doc)
+    doc.ClearSelection2(True)
+    face.Select4(False, sw.nothing())
+    sm = doc.SketchManager
+    sm.InsertSketch(True)
+    if sm.ActiveSketch is None:
+        raise RuntimeError("Could not open a sketch on the face")
+    a, b = _transform_points(sw.m0(sm.ActiveSketch, "ModelToSketchTransform"), [p1, p2])
+    sm.AddToDB = True
+    try:
+        sm.CreateLine(a[0], a[1], 0, b[0], b[1], 0)
+    finally:
+        sm.AddToDB = False
+        sm.InsertSketch(True)
+    return sw.last_feature_of_type(doc, "ProfileFeature")
+
+
+def _sketched_bend(doc: Any, sketch: Any, angle: float, reverse: bool, radius: float) -> Any:
+    data = doc.FeatureManager.CreateDefinition(sw.constant("swFmSketchBend"))
+    data.BendAngle = deg(angle)
+    data.ReverseDirection = reverse
+    if radius > 0:
+        data.UseDefaultBendRadius = False
+        data.BendRadius = mm(radius)
+    doc.ClearSelection2(True)
+    sketch.Select2(False, 0)
+    feat = doc.FeatureManager.CreateFeature(data)
+    doc.ClearSelection2(True)
+    return feat
+
+
+def _face_at(doc: Any, point_m: tuple) -> Any:
+    dist, face = sw.nearest(doc, "face", [c / MM for c in point_m])
+    if face is None or dist > sw.TOLERANCE:
+        raise LookupError(f"No face within 0.5 mm of {[round(c / MM, 3) for c in point_m]} mm")
+    return face
+
+
+@tool
+def sketched_bend(line_start: list[float], line_end: list[float], angle: float = 90.0, reverse: bool = False,
+                  bend_radius: float = 0.0) -> dict:
+    """Sheet metal bend along a line drawn on a flat face, from line_start to
+    line_end ([x,y,z] mm, both on the face; the line may overrun the
+    face). The side containing the part's origin (the larger side) stays;
+    the other folds up by `angle` degrees, or down with reverse=true.
+    bend_radius 0 = the part's default. Works on the flat plate; a second
+    bend on an already bent flange is refused (the fixed face cannot be set
+    through the API here), so build steps as separate flanges instead."""
+    doc = sw.active_doc(DOC_PART)
+    p1, p2 = tuple(mm(v) for v in line_start), tuple(mm(v) for v in line_end)
+    mid = tuple((p1[i] + p2[i]) / 2 for i in range(3))
+    sketch = _line_sketch_on_face(doc, _face_at(doc, mid), p1, p2)
+    before = _body_box(doc)
+    feat = _sketched_bend(doc, sketch, angle, reverse, bend_radius)
+    if feat is None:
+        _delete_feature_obj(doc, sketch)
+        raise RuntimeError("SOLIDWORKS did not bend along that line")
+    result = _feature_result(feat, "sketched bend")
+    result["box_mm"] = {"before": [round(v / MM, 2) for v in before], "after": [round(v / MM, 2) for v in _body_box(doc)]}
+    return result
+
+
 # --- Assembly management ----------------------------------------------------
 
 MATE_TYPES = {0: "coincident", 1: "concentric", 2: "perpendicular", 3: "parallel", 4: "tangent", 5: "distance",
@@ -4334,6 +4561,30 @@ def replace_component(name: str, path: str, all_instances: bool = False, configu
     sw.m0(asm, "EditRebuild3")
     now = [c.Name2 for c in asm.GetComponents(True) or () if os.path.normcase(sw.m0(c, "GetPathName") or "") == os.path.normcase(target)]
     return {"replaced": name, "old_file": old, "new_file": target, "components_now": now}
+
+
+@tool
+def mirror_components(components: list[str], plane: str = "right") -> dict:
+    """Mirror assembly components (names as in list_components) about a
+    plane ("front"/"top"/"right" or a plane name): adds mirrored instances
+    of the same files (no opposite-hand parts are made)."""
+    import pythoncom
+    from win32com.client import VARIANT
+
+    asm = sw.active_doc(DOC_ASSEMBLY)
+    comps = [_component(asm, n) for n in components]
+    key = plane.lower()
+    target = sw.standard_plane(asm, key) if key in sw.PLANE_NAMES else sw.feature(asm, plane)
+    before = {c.Name2 for c in asm.GetComponents(True) or ()}
+    orient = sw.constant("swMirrorComponentOrientation_None")
+    asm.MirrorComponents3(
+        target, VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, comps),
+        VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_I4, [orient] * len(comps)), False,
+        sw.empty(), False, sw.empty(), 0, "", "", 0, False, False, False)
+    added = [c for c in asm.GetComponents(True) or () if c.Name2 not in before]
+    if not added:
+        raise RuntimeError("SOLIDWORKS did not mirror the components")
+    return {"mirrored": [{"component": c.Name2, "origin_mm": [round(v / MM, 3) for v in _origin(c)]} for c in added]}
 
 
 # --- Escape hatches -------------------------------------------------------

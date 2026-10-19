@@ -81,6 +81,18 @@ user in Korean.
     swSFSymbolRoughnessValue1; the Korean revision template has a title
     row above the column headings and calls the description "비고".
     Table positions are their anchor corner (`_table_box`).
+20. Drawing views' visible *vertices* report GetPoint shifted by the view's
+    sheet Position (edges and circle centres do not): `_vertex_point`.
+    IView.InsertBreak3 takes positions relative to the view centre in
+    sheet metres, with the view activated (not selected), then BreakView.
+    Variable fillet = FeatureFillet3 type 1 with per-vertex radii; face
+    fillet = type 2 with both faces mark 0. Weld symbols are text codes
+    "<WELD-FILL>" etc. from gtol.sym (SetText's last argument is a long).
+    MirrorComponents3 with ComponentsToInstance mirrors instances only.
+    Sketched bends work via CreateDefinition(swFmSketchBend); SetFixedFace
+    rejects every argument form, so SOLIDWORKS keeps the origin side, and a
+    bend on an already bent flange is refused. IModelDoc2.
+    InsertSheetMetalJog created nothing in 48 argument/selection variants.
 
 ## Verified on the real SOLIDWORKS
 
@@ -99,6 +111,8 @@ functions, each result checked (volumes, positions, PDFs rendered):
   two edges, hem.
 - Weldments: structural_member (iso square tube, mitre corners),
   trim_members, end_cap, gusset (triangle, polygon), cut_list.
+- More parts/sheet metal/assemblies: variable_fillet, face_fillet,
+  sketched_bend, mirror_components.
 - Assemblies: insert_component, add_mate (coincident, distance; faces
   found through component bodies), list_mates, set_component,
   component_pattern (linear, circular), exploded_view, replace_component.
@@ -108,7 +122,8 @@ functions, each result checked (volumes, positions, PDFs rendered):
   add_dimension, set_tolerance, hole_table, title_block ("a3 - iso"),
   bom_table, auto_balloons, drawing_sheets, datum, geometric_tolerance,
   surface_finish, revision_table, broken_out_section, auxiliary_view,
-  cut_list_table, export PDF (all sheets, Korean text) and DXF.
+  cut_list_table, weld_symbol, ordinate_dimensions, break_view, export
+  PDF (all sheets, Korean text) and DXF.
 
 Macro recordings and argument tables: `docs/recordings/HANDOFF.md`.
 
@@ -122,5 +137,6 @@ Macro recordings and argument tables: `docs/recordings/HANDOFF.md`.
 3. Not rechecked on the real SOLIDWORKS: revolve, chamfer,
    circular_pattern, mirror, shell, loft, rib, check_interference,
    export_flat_pattern options, Hole Wizard sizes other than M4/M6/M8.
-4. Drawings: no weld symbols, ordinate dimensions or break (shortened)
-   views yet.
+4. Sheet metal jog: no working API path found (see rule 20); a second
+   sketched bend on a bent flange fails for the same fixed-face reason.
+5. mirror_components makes instances only, not opposite-hand parts.
