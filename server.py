@@ -301,11 +301,22 @@ def list_features(include_hidden: bool = False) -> list[dict]:
     return out
 
 
+def _dim_kind(dim: Any) -> str:
+    """"linear", "angular" or "integer" (e.g. pattern counts), from
+    swDimensionParamType_e (0, 1, 2 as read from swconst.tlb in 2025)."""
+    kind = sw.m0(dim, "GetType")
+    try:
+        angular, integer = sw.constant("swDimensionParamTypeDoubleAngular"), sw.constant("swDimensionParamTypeInteger")
+    except Exception:
+        angular, integer = 1, 2  # swconst unreadable (tests without SOLIDWORKS)
+    return {angular: "angular", integer: "integer"}.get(kind, "linear")
+
+
 def _dim_value(dim: Any) -> tuple[float, str]:
-    kind = sw.m0(dim, "GetType")  # swDimensionParamType_e: 0 linear, 1 angular, 2 integer (e.g. pattern counts)
-    if kind == sw.constant("swDimensionParamTypeDoubleAngular"):
+    kind = _dim_kind(dim)
+    if kind == "angular":
         return round(math.degrees(dim.SystemValue), 6), "deg"
-    if kind == sw.constant("swDimensionParamTypeInteger"):
+    if kind == "integer":
         return round(dim.SystemValue, 6), ""
     return round(dim.SystemValue / MM, 6), "mm"
 
@@ -424,13 +435,8 @@ def set_dimension(name: str, value: float, configurations: Literal["this", "all"
     dim = doc.Parameter(name)
     if dim is None:
         raise LookupError(f"No dimension {name!r}; use list_dimensions")
-    kind = sw.m0(dim, "GetType")
-    if kind == sw.constant("swDimensionParamTypeDoubleAngular"):
-        system = deg(value)
-    elif kind == sw.constant("swDimensionParamTypeInteger"):
-        system = float(round(value))  # counts, e.g. pattern instances
-    else:
-        system = mm(value)
+    kind = _dim_kind(dim)
+    system = deg(value) if kind == "angular" else float(round(value)) if kind == "integer" else mm(value)
     which = 1 if configurations == "this" else 2  # swSetValue_InThisConfiguration / _InAllConfigurations
     status = _call_first(dim, [
         ("SetSystemValue3", (system, which, sw.nothing())),
