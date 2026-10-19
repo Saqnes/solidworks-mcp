@@ -12,7 +12,8 @@ def fm(name, n):
 d.FeatureManager.InsertProtrusionSwept4 = fm("InsertProtrusionSwept4", 20)
 d.FeatureManager.InsertCutSwept5 = fm("InsertCutSwept5", 22)
 d.FeatureManager.InsertProtrusionBlend2 = fm("InsertProtrusionBlend2", 18)
-d.FeatureManager.InsertRib = fm("InsertRib", 9)
+d.FeatureManager.InsertRib = fm("InsertRib", 10)
+d.GetMassProperties = lambda: (0, 0, 0, 1e-6 * len(calls), 0, 0)  # rib checks that the volume grew
 d.FeatureManager.InsertSheetMetalBaseFlange2 = fm("InsertSheetMetalBaseFlange2", 19)
 d.feats += [Feat("경로", "3DProfileFeature"), Feat("단면", "ProfileFeature"), Feat("단면2", "ProfileFeature")]
 from mcp.client import Client

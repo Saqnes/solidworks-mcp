@@ -16,6 +16,12 @@ user in Korean.
   (e.g. `python -c "import server; ..."` or call tool functions via
   `server.<tool>.__wrapped__` inside `sw.call`). Close test documents
   without saving; the user keeps real files in `Desktop\sw_test`.
+- Regression on the real SOLIDWORKS: `.venv\Scripts\python
+  tests\live\run_live.py [group ...]` (parts, holes, sheetmetal, weldment,
+  assembly, drawing; ~2 min for all). Each check compares with a
+  hand-computed value; it only opens/closes its own `live_*` documents in a
+  temp folder. Run it before pushing changes to existing tools and add a
+  check for each new tool.
 - Commit style: imperative subject, body explains the observed failure and
   the fix. Push to `main`.
 - Install: `install.cmd` → `install.ps1` (venv, pip, registration, check);
@@ -120,6 +126,19 @@ user in Korean.
     searchflag False. New views keep 30 mm from the sheet edges
     (`_free_spot` margin) and automatic dimensions flip to the other side
     of a view when the border would push them onto it (`_beside_view`).
+24. InsertRib takes 10 arguments here and returns None even when it builds
+    the rib: find it as the newest "Rib" feature and check the volume grew
+    (else retry with the other material side). Mates, found by trying:
+    symmetric = both entities mark 1 + symmetry plane mark 2; gear and lock
+    = AddMate5 with entities mark 1 (gear ratio = the two sizes in the
+    GearRatio arguments); limit distance/angle = AddMate5 type 5/6 with the
+    limits in the Abs Upper/Lower arguments (IMate2 Maximum/MinimumVariation
+    read back *relative to* the value). Width: AddMate5 type 11 fails with
+    every mark combination; CreateMateData(swMateWIDTH) with
+    WidthSelection/TabSelection object arrays + CreateMate works for two
+    tab faces (a cylinder tab is refused alone and moves nothing when given
+    twice). GetComponents order is not insertion order. Load errors are
+    reported by name via `sw.load_error` (swFileLoadError_e + Korean hint).
 
 ## Verified on the real SOLIDWORKS
 
@@ -133,7 +152,11 @@ functions, each result checked (volumes, positions, PDFs rendered):
   move_body (move, copy), face_color, import_file (STEP), materials,
   equations, configurations, measure, model_info (body box).
 - Holes: Hole Wizard counterbore, tapped (cosmetic thread), clearance,
-  all without the near-side countersink.
+  countersink, every size M2–M20, all without the near-side countersink.
+  Countersink M2/M2.5 fall back to a sketch cut (ISO 10642 has no such
+  sizes).
+- Also: revolve (+ cut), chamfer, shell, circular_pattern, mirror, loft,
+  rib, check_interference, export_flat_pattern bend lines, rename_feature.
 - Sheet metal: base flange, edge_flange (90° and 60°), miter_flange along
   two edges, hem.
 - Weldments: structural_member (iso square tube, mitre corners),
@@ -141,7 +164,8 @@ functions, each result checked (volumes, positions, PDFs rendered):
 - More parts/sheet metal/assemblies: variable_fillet, face_fillet,
   sketched_bend, mirror_components.
 - Assemblies: insert_component, add_mate (coincident, distance; faces
-  found through component bodies), list_mates, set_component,
+  found through component bodies; symmetric, width, gear, lock, limit
+  distance/angle), list_mates (limits), set_component,
   component_pattern (linear, circular), exploded_view, replace_component.
 - Drawings: make_drawing with model dimensions and hole callouts,
   drawing_view (isometric, exploded), section_view, detail_view,
@@ -164,9 +188,8 @@ Macro recordings and argument tables: `docs/recordings/HANDOFF.md`.
    carry none); dimension_holes adds ordinate dimensions in the drawing.
 2. Weldments: the cut list table's description column ("비고") stays empty
    with the Korean template (the cut list property is "설명").
-3. Not rechecked on the real SOLIDWORKS: revolve, chamfer,
-   circular_pattern, mirror, shell, loft, rib, check_interference,
-   export_flat_pattern options, Hole Wizard sizes other than M4/M6/M8.
+3. Width mate with a cylindrical tab: no working API form found (rule 24);
+   add_mate asks for the tab's two side faces.
 4. Sheet metal jog: no working API path found (see rule 20); a second
    sketched bend on a bent flange fails for the same fixed-face reason.
 5. mirror_components makes instances only, not opposite-hand parts.

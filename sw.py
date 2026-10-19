@@ -210,27 +210,64 @@ def constant(name: str) -> int:
     global _constants
     import pythoncom
 
-    if _constants is None:
-        table: dict[str, int] = {}
-        for path in _swconst_paths():
-            if not os.path.exists(path):
-                continue
-            tlb = pythoncom.LoadTypeLib(path)
-            for i in range(tlb.GetTypeInfoCount()):
-                ti = tlb.GetTypeInfo(i)
-                attr = ti.GetTypeAttr()
-                if attr.typekind != pythoncom.TKIND_ENUM:
-                    continue
-                for j in range(attr.cVars):
-                    vd = ti.GetVarDesc(j)
-                    table[ti.GetNames(vd.memid)[0]] = vd.value
-            break
-        if not table:
-            raise RuntimeError("Could not read swconst.tlb from the SOLIDWORKS installation")
-        _constants = table
+    _load_constants()
     if name not in _constants:
         raise LookupError(f"SOLIDWORKS has no constant {name!r}")
     return _constants[name]
+
+
+_enums: dict[str, dict[int, str]] = {}
+
+
+def enum_names(enum: str) -> dict[int, str]:
+    """{value: member name} of one swconst enum, e.g. "swFileLoadError_e"."""
+    _load_constants()
+    return _enums.get(enum, {})
+
+
+def _load_constants() -> None:
+    global _constants
+    import pythoncom
+
+    if _constants is not None:
+        return
+    table: dict[str, int] = {}
+    for path in _swconst_paths():
+        if not os.path.exists(path):
+            continue
+        tlb = pythoncom.LoadTypeLib(path)
+        for i in range(tlb.GetTypeInfoCount()):
+            ti = tlb.GetTypeInfo(i)
+            attr = ti.GetTypeAttr()
+            if attr.typekind != pythoncom.TKIND_ENUM:
+                continue
+            members = _enums.setdefault(ti.GetDocumentation(-1)[0], {})
+            for j in range(attr.cVars):
+                vd = ti.GetVarDesc(j)
+                member = ti.GetNames(vd.memid)[0]
+                table[member] = vd.value
+                members.setdefault(vd.value, member)
+        break
+    if not table:
+        raise RuntimeError("Could not read swconst.tlb from the SOLIDWORKS installation")
+    _constants = table
+
+
+LOAD_HINTS = {
+    "swFileNotFoundError": "파일이 없습니다",
+    "swFileWithSameTitleAlreadyOpen": "같은 이름의 다른 파일이 이미 열려 있습니다; 그 문서를 닫거나 파일 이름을 바꾸세요",
+    "swFutureVersion": "더 새 버전의 SOLIDWORKS에서 저장된 파일입니다",
+    "swInvalidFileTypeError": "지원하지 않는 파일 형식입니다",
+    "swLowResourcesError": "메모리가 부족합니다",
+}
+
+
+def load_error(code: int) -> str:
+    """swFileLoadError_e bits as names (with a hint for the common ones)."""
+    names = enum_names("swFileLoadError_e") if code else {}
+    parts = [names.get(bit, str(bit)) for bit in (1 << i for i in range(32)) if code & bit] or [str(code)]
+    hints = [LOAD_HINTS[n] for n in parts if n in LOAD_HINTS]
+    return ", ".join(parts) + (f" ({'; '.join(hints)})" if hints else "")
 
 
 # --- Connection -----------------------------------------------------------

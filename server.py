@@ -32,11 +32,23 @@ from sw import DOC_ASSEMBLY, DOC_DRAWING, DOC_PART, MM, call, deg, mm
 mcp = MCPServer(
     "solidworks",
     instructions=(
-        "Drives SOLIDWORKS via its API. Units: millimetres and degrees. Typical flow: "
-        "status -> new_document or open_document -> sketch -> extrude/revolve -> "
-        "screenshot to check -> save. Feature and plane names are localized (the UI may "
-        "be Korean), so read them from list_features instead of guessing. For anything "
-        "without a dedicated tool, use run_api_script."
+        "Drives SOLIDWORKS via its API. Units: millimetres and degrees; points are model "
+        "coordinates [x, y, z] in mm.\n"
+        "Parts: status -> new_document or open_document -> sketch -> extrude/revolve/hole/... "
+        "-> model_info (volume, bounding box) or screenshot to check -> save. Drawings: "
+        "make_drawing (views, model dimensions, hole callouts) -> more views and annotations "
+        "-> title_block -> export to PDF/DXF. Nothing is saved unless you call save.\n"
+        "Sketch coordinates (x, y) on the default planes are model (x, y, 0) on front, "
+        "(x, 0, -y) on top and (0, y, -x) on right; extrudes go along +z, +y and +x.\n"
+        "Faces, edges and vertices are picked by a model point on them (within 0.5 mm; "
+        "hidden ones too): work points out from model_info's bounding box.\n"
+        "Names of planes, features, views and components are localized (the UI may be "
+        "Korean: 정면/윗면/우측면, 도면뷰1): take them from list_features, list_views and "
+        "list_components instead of guessing.\n"
+        "Tools check their result and raise an error that says why; fix the input rather "
+        "than repeating the same call. A timeout usually means a dialog is open in "
+        "SOLIDWORKS: ask the user to close it. For anything without a dedicated tool, use "
+        "run_api_script."
     ),
 )
 
@@ -123,7 +135,7 @@ def open_document(path: str) -> dict:
     errors, warnings = sw.out_int(), sw.out_int()
     doc = app.OpenDoc6(str(Path(path)), sw.DOC_TYPES[ext], 1, "", errors, warnings)  # 1 = silent
     if doc is None:
-        raise RuntimeError(f"Open failed (swFileLoadError {errors.value}) for {path}")
+        raise RuntimeError(f"Open failed: {sw.load_error(errors.value)} - {path}")
     active = app.ActivateDoc3(sw.m0(doc, "GetTitle"), False, 0, sw.out_int())
     return {**sw.doc_info(active or doc), "warnings": warnings.value}
 
@@ -508,6 +520,20 @@ def suppress_feature(name: str, suppress: bool = True, configurations: Literal["
         raise RuntimeError(f"Could not change suppression of {name!r}")
     _rebuild(doc)
     return f"{'suppressed' if suppress else 'unsuppressed'} {name} ({configurations} configuration{'s' if configurations == 'all' else ''})"
+
+
+@tool
+def rename_feature(name: str, new_name: str) -> dict:
+    """Rename a feature, sketch, plane or mate (names from list_features or
+    list_mates), e.g. to give the tree meaningful names."""
+    doc = sw.active_doc()
+    feat = sw.feature(doc, name)
+    if new_name != name and doc.FeatureByName(new_name) is not None:
+        raise ValueError(f"{new_name!r} is already used in this document")
+    feat.Name = new_name
+    if feat.Name != new_name:
+        raise RuntimeError(f"SOLIDWORKS kept the name {feat.Name!r}; the new name may contain characters it does not allow")
+    return {"renamed": name, "name": feat.Name}
 
 
 def _material_library() -> list[dict]:
@@ -1122,7 +1148,7 @@ def insert_component(path: str, position: list[float] | None = None) -> dict:
         raise ValueError("Component must be a .sldprt or .sldasm file")
     errors, warnings = sw.out_int(), sw.out_int()
     if app.OpenDoc6(str(Path(path)), sw.DOC_TYPES[ext], 1, "", errors, warnings) is None:
-        raise RuntimeError(f"Could not open {path} (error {errors.value})")
+        raise RuntimeError(f"Could not open {path}: {sw.load_error(errors.value)}")
     asm = app.ActivateDoc3(asm_title, False, 0, sw.out_int())
     x, y, z = (mm(v) for v in (position or [0, 0, 0]))
     comp = asm.AddComponent5(str(Path(path)), 0, "", False, "", x, y, z)
@@ -1141,13 +1167,40 @@ def list_components(top_level_only: bool = True) -> list[dict]:
     ]
 
 
-MATES = {"coincident": 0, "concentric": 1, "perpendicular": 2, "parallel": 3, "tangent": 4, "distance": 5, "angle": 6}
+MATES = {"coincident": 0, "concentric": 1, "perpendicular": 2, "parallel": 3, "tangent": 4, "distance": 5, "angle": 6,
+         "symmetric": 8, "gear": 10, "lock": 16}
+WIDTH_MATE = 11  # swMateWIDTH: AddMate5 refuses every selection; it needs CreateMateData
 ALIGN = {"aligned": 0, "anti_aligned": 1, "closest": 2}
+
+
+def _picked(asm: Any, entity: str, point: list[float]) -> Any:
+    """The face/edge/vertex nearest an assembly point (mm), as an object."""
+    asm.ClearSelection2(True)
+    sw.select_at(asm, entity, point, append=False)
+    obj = asm.SelectionManager.GetSelectedObject6(1, -1)
+    asm.ClearSelection2(True)
+    if obj is None:
+        raise LookupError(f"Nothing selectable at {point} mm")
+    return obj
+
+
+def _width_mate(asm: Any, width: list[Any], tab: list[Any]) -> Any:
+    import pythoncom
+    from win32com.client import VARIANT
+
+    data = asm.CreateMateData(WIDTH_MATE)
+    if data is None:
+        raise RuntimeError("SOLIDWORKS could not start a width mate")
+    data.WidthSelection = VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, width)
+    data.TabSelection = VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, tab)
+    data.ConstraintType = sw.constant("swMateWidth_Centered")
+    return asm.CreateMate(data)
 
 
 @tool
 def add_mate(
-    mate: Literal["coincident", "concentric", "perpendicular", "parallel", "tangent", "distance", "angle"],
+    mate: Literal["coincident", "concentric", "perpendicular", "parallel", "tangent", "distance", "angle",
+                  "symmetric", "width", "gear", "lock"],
     point1: list[float],
     point2: list[float],
     entity1: Literal["face", "edge", "vertex"] = "face",
@@ -1155,21 +1208,62 @@ def add_mate(
     value: float = 0.0,
     align: Literal["aligned", "anti_aligned", "closest"] = "closest",
     flip: bool = False,
+    min_value: float | None = None,
+    max_value: float | None = None,
+    plane: str = "right",
+    tab_points: list[list[float]] | None = None,
+    ratio: float = 1.0,
 ) -> dict:
-    """Mate two entities picked by assembly-space points (mm). `value` is the
-    distance (mm) for distance mates or the angle (deg) for angle mates."""
+    """Mate two entities picked by assembly-space points (mm).
+    - distance / angle: `value` is the distance (mm) or angle (deg); give
+      min_value and max_value too for a limit mate (value is where it starts).
+    - symmetric: the two entities mirror each other about `plane`
+      ("front"/"top"/"right" or a plane name from list_features).
+    - width: point1/point2 are the two width faces (a slot's walls) and
+      tab_points one point on each of the tab's two side faces; the tab is
+      centred between the walls.
+    - gear: two cylindrical faces or circular edges; entity2 turns `ratio`
+      times per turn of entity1 (e.g. teeth 20/40 -> 0.5).
+    - lock: fixes the two components to each other (any face of each)."""
     asm = sw.active_doc(DOC_ASSEMBLY)
+    limit = min_value is not None or max_value is not None
+    if limit and mate not in ("distance", "angle"):
+        raise ValueError("min_value/max_value only apply to distance and angle mates")
+    if limit and (min_value is None or max_value is None or not min_value <= value <= max_value):
+        raise ValueError("A limit mate needs min_value <= value <= max_value")
+    if mate == "width":
+        if not tab_points or len(tab_points) != 2:
+            # a cylinder as the tab: refused alone, and given twice the mate is made but moves nothing
+            raise ValueError("A width mate needs tab_points: one point on each of the tab's two side faces")
+        walls = [_picked(asm, entity1, point1), _picked(asm, entity2, point2)]
+        feat = _width_mate(asm, walls, [_picked(asm, "face", p) for p in tab_points])
+        if feat is None:
+            raise RuntimeError("Width mate failed; point1/point2 must be two parallel faces and the tab inside them")
+        sw.m0(asm, "EditRebuild3")
+        return {"mate": feat.Name, "type": mate}
     asm.ClearSelection2(True)
     sw.select_at(asm, entity1, point1, append=False, mark=1)
     sw.select_at(asm, entity2, point2, append=True, mark=1)
-    dist = mm(value) if mate == "distance" else 0
-    ang = deg(value) if mate == "angle" else 0
+    if mate == "symmetric":  # the symmetry plane goes in with mark 2
+        key = plane.lower()
+        target = sw.standard_plane(asm, key) if key in sw.PLANE_NAMES else sw.feature(asm, plane)
+        if not target.Select2(True, 2):
+            raise RuntimeError(f"Could not select plane {target.Name!r}")
+    unit = mm if mate == "distance" else deg
+    nominal = unit(value) if mate in ("distance", "angle") else 0
+    high, low = (unit(max_value), unit(min_value)) if limit else (nominal, nominal)
+    dist = (nominal, high, low) if mate == "distance" else (0, 0, 0)
+    ang = (nominal, high, low) if mate == "angle" else (0, 0, 0)
+    gear = (0.01 * ratio, 0.01) if mate == "gear" else (1, 1)  # the two sizes, entity1 : entity2
     err = sw.out_int()
-    feat = asm.AddMate5(MATES[mate], ALIGN[align], flip, dist, dist, dist, 1, 1, ang, ang, ang, False, False, 0, err)
+    feat = asm.AddMate5(MATES[mate], ALIGN[align], flip, *dist, *gear, *ang, False, False, 0, err)
     if feat is None:
         raise RuntimeError(f"Mate failed (swAddMateError {err.value})")
     sw.m0(asm, "EditRebuild3")
-    return {"mate": feat.Name}
+    result = {"mate": feat.Name, "type": mate}
+    if limit:
+        result["limits"] = [min_value, max_value]
+    return result
 
 
 # --- Drawings -------------------------------------------------------------
@@ -2659,10 +2753,13 @@ def dimension_holes(view: str = "") -> dict:
         return picked
 
     x1, y1, x2, y2 = sw.m0(target, "GetOutline")
+    # beyond any dimensions already on that side, or SOLIDWORKS drops the new row
+    top = 0.012 + 0.008 * _dimension_count(target, "top")
+    left = 0.012 + 0.008 * _dimension_count(target, "left")
     across = _ordinate(drw, target, origin, distinct(0), "horizontal",
-                       *_beside_view(drw, target, "top", 0.012, (x1 + x2) / 2))
+                       *_beside_view(drw, target, "top", top, (x1 + x2) / 2))
     up = _ordinate(drw, target, origin, distinct(1), "vertical",
-                   *_beside_view(drw, target, "left", 0.012, (y1 + y2) / 2))
+                   *_beside_view(drw, target, "left", left, (y1 + y2) / 2))
     drw.ForceRebuild3(False)
     return {"view": target.Name, "holes": len(holes), "horizontal_dimensions": across, "vertical_dimensions": up}
 
@@ -3131,7 +3228,7 @@ def import_file(path: str) -> dict:
     errors = sw.out_int()
     doc = app.LoadFile4(target, "r", data, errors)
     if doc is None:
-        raise RuntimeError(f"Import failed (swFileLoadError {errors.value}) for {target}")
+        raise RuntimeError(f"Import failed: {sw.load_error(errors.value)} - {target}")
     info = sw.doc_info(doc)
     if sw.m0(doc, "GetType") == DOC_PART:
         info["bodies"] = len(doc.GetBodies2(0, True) or ())
@@ -3527,7 +3624,7 @@ def export_folder(folder: str, extension: str = "step", recursive: bool = False,
                 errors, warnings = sw.out_int(), sw.out_int()
                 doc = app.OpenDoc6(str(src), sw.DOC_TYPES[src.suffix.lower()], 1, "", errors, warnings)
                 if doc is None:
-                    results.append({"file": src.name, "error": f"open failed (swFileLoadError {errors.value})"})
+                    results.append({"file": src.name, "error": f"open failed: {sw.load_error(errors.value)}"})
                     continue
             errors, warnings = sw.out_int(), sw.out_int()
             before = sw.mtime(str(target))
@@ -4075,12 +4172,33 @@ def rib(thickness: float, sketch_name: str = "", both_sides: bool = True, flip_m
     """Rib from an open sketch (e.g. one line between two walls), default
     the most recent sketch; thickness in mm."""
     doc = sw.active_doc(DOC_PART)
-    doc.ClearSelection2(True)
-    sw.select_feature(doc, sketch_name or _last_sketch_name(doc))
-    feat = _call_first(doc.FeatureManager, [
-        ("InsertRib", (both_sides, False, mm(thickness), 0, flip_material, False, True, 0, False)),
-    ])
-    return _feature_result(feat, "rib")
+    sketch = sketch_name or _last_sketch_name(doc)
+
+    def attempt(flip: bool) -> Any:
+        doc.ClearSelection2(True)
+        sw.select_feature(doc, sketch)
+        # two-sided, reverse thickness, thickness, reference edge, reverse material,
+        # drafted, draft outward, draft angle, normal to sketch(, drafted from wall)
+        args = (both_sides, False, mm(thickness), 0, flip, False, False, 0.0, False)
+        last = doc.FeatureByPositionReverse(0).Name
+        made = _call_first(doc.FeatureManager, [("InsertRib", args + (False,)), ("InsertRib", args)])
+        if made is None:  # InsertRib builds the rib but returns nothing: look at the tree
+            newest = doc.FeatureByPositionReverse(0)
+            made = newest if newest.Name != last and sw.m0(newest, "GetTypeName2") == "Rib" else None
+        return made
+
+    before = sw.m0(doc, "GetMassProperties")
+    feat = attempt(flip_material)
+    after = sw.m0(doc, "GetMassProperties")
+    if feat is None or (before and after and after[3] <= before[3] + 1e-12):
+        if feat is not None:  # material went the wrong way (into nothing): try the other side
+            _delete_feature_obj(doc, feat)
+        feat = attempt(not flip_material)
+    result = _feature_result(feat, "rib")
+    after = sw.m0(doc, "GetMassProperties")
+    if before and after:
+        result["volume_added_mm3"] = round((after[3] - before[3]) / MM**3, 2)
+    return result
 
 
 # --- Sheet metal --------------------------------------------------------------
@@ -4685,10 +4803,13 @@ def list_mates() -> list[dict]:
                     comp = sw.m0(mate.MateEntity(i), "ReferenceComponent")
                     comps.append(comp.Name2 if comp is not None else None)
                 info["components"] = comps
-                if kind == 5:
-                    info["distance_mm"] = round(sw.m0(mate, "DisplayDimension").GetDimension2(0).Value, 4)
-                elif kind == 6:
-                    info["angle_deg"] = round(sw.m0(mate, "DisplayDimension").GetDimension2(0).Value, 4)
+                if kind in (5, 6):
+                    value = sw.m0(mate, "DisplayDimension").GetDimension2(0).Value
+                    info["distance_mm" if kind == 5 else "angle_deg"] = round(value, 4)
+                    high, low = mate.MaximumVariation, mate.MinimumVariation  # limits, relative to the value
+                    if high != low:  # a limit mate
+                        scale = 1 / MM if kind == 5 else 180 / math.pi
+                        info["limits"] = [round(value + low * scale, 4) + 0.0, round(value + high * scale, 4) + 0.0]
             except Exception as exc:
                 info.setdefault("problem", f"{type(exc).__name__}: {exc}")
             out.append(info)
