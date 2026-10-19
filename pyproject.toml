@@ -15,6 +15,7 @@ dependencies = [
 
 [project.scripts]
 solidworks-mcp = "server:main"
+solidworks-mcp-doctor = "doctor:main"
 
 [tool.setuptools]
-py-modules = ["server", "sw"]
+py-modules = ["server", "sw", "doctor"]

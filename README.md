@@ -39,40 +39,63 @@ Windows에서 "Beta: 세계 언어 지원을 위해 Unicode UTF-8 사용"이 켜
 
 ## 설치 (SOLIDWORKS가 깔린 Windows PC)
 
-업데이트는 `cd C:\mcp\solidworks-mcp` 후 `git pull`, 그리고 Claude Desktop 재시작입니다.
+**준비물:** SOLIDWORKS(2025 SP2에서 확인), [Python 3.11 이상](https://www.python.org/downloads/)(설치 화면에서 *Add python.exe to PATH* 체크), Claude Desktop 또는 Claude Code.
 
-Python 3.11 이상이 필요합니다.
+1. **받기**: 아래 중 하나. 폴더 위치는 어디든 됩니다(한글 경로 가능).
+   - git: `git clone https://github.com/Saqnes/solidworks-mcp C:\mcp\solidworks-mcp`
+   - git이 없으면: GitHub 페이지의 **Code > Download ZIP**을 받아 원하는 폴더에 압축을 풉니다.
+2. **설치**: 그 폴더의 `install.cmd`를 더블클릭합니다. 30초~1분쯤 걸리며 아래를 알아서 합니다.
+   - Python 3.11+ 찾기 → `.venv` 가상환경 → 패키지 설치(mcp, pywin32, pillow)
+   - Claude Desktop 설정(`claude_desktop_config.json`)에 `solidworks` 등록. 다른 서버·설정은 그대로 두고, 바꾸기 전에 `.bak` 백업을 만듭니다. Microsoft Store판 Claude도 지원합니다.
+   - `claude` 명령(Claude Code)이 있으면 Claude Code에도 등록
+   - 설치 점검: Python, 패키지, SOLIDWORKS COM 등록, 기본 템플릿, PDF 프린터, 등록 상태를 `[ OK ]` / `[주의]` / `[실패]`로 보여 줍니다.
+3. **Claude Desktop을 완전히 종료**(작업 표시줄 트레이 아이콘 > 종료)했다가 다시 켭니다. 창만 닫으면 서버가 다시 읽히지 않습니다.
+
+| 할 일 | 방법 |
+|---|---|
+| 업데이트 | `update.cmd` 더블클릭(`git pull` 후 재설치·점검). ZIP으로 받았다면 새 ZIP을 같은 폴더에 덮어쓰고 `install.cmd` |
+| 점검만 다시 | 폴더에서 `.venv\Scripts\python doctor.py` |
+| 제거 | `.venv\Scripts\python doctor.py --unregister`(Claude Desktop), `claude mcp remove solidworks --scope user`(Claude Code), 그다음 폴더 삭제 |
+| 옵션 | `powershell -ExecutionPolicy Bypass -File install.ps1 -NoDesktop -NoClaudeCode -Python C:\경로\python.exe` |
+
+SOLIDWORKS가 실행 중이면 그 창에 연결하고, 실행 중이 아니면 도구를 처음 쓸 때 새로 띄웁니다.
+`도구 > 옵션 > 시스템 옵션 > 기본 템플릿`에 파트/어셈블리/도면 템플릿이 지정되어 있어야 `new_document`와 `make_drawing`이 동작합니다(점검에서 확인).
+
+### 문제 해결
+
+| 증상 | 해결 |
+|---|---|
+| Claude에 solidworks 도구가 안 보임 | Claude Desktop을 트레이에서 **종료** 후 재실행. 그래도 없으면 `doctor.py`로 등록 경로 확인 |
+| "Python 3.11 이상이 없습니다" | python.org에서 설치(PATH 체크) 또는 `winget install Python.Python.3.12`. `python`을 치면 Microsoft Store가 열리는 PC는 Store용 바로가기만 있는 상태입니다 |
+| 패키지 설치 실패 | 인터넷/회사 프록시 확인. 프록시면 `set HTTPS_PROXY=http://프록시:포트` 후 `install.cmd` |
+| `install.cmd`가 바로 닫힘/차단 | 파일 속성에서 *차단 해제* 체크, 또는 PowerShell에서 위 옵션 줄로 실행 |
+| 기본 템플릿 [실패] | SOLIDWORKS 옵션에서 기본 템플릿 지정 |
+| 도면 PDF에 한글이 빠짐 | Windows "UTF-8 사용(베타)" 설정 때문입니다. 서버가 자동으로 "Microsoft Print to PDF"로 인쇄하므로 그 프린터가 켜져 있어야 합니다(점검에서 확인) |
+
+<details>
+<summary>수동 설정(설치 스크립트를 쓰지 않을 때)</summary>
 
 ```powershell
-git clone https://github.com/Saqnes/solidworks-mcp C:\mcp\solidworks-mcp
 cd C:\mcp\solidworks-mcp
 python -m venv .venv
 .venv\Scripts\pip install -e .
 ```
 
-### Claude Desktop
-
-`%APPDATA%\Claude\claude_desktop_config.json`:
+`%APPDATA%\Claude\claude_desktop_config.json`의 `mcpServers`에 추가:
 
 ```json
-{
-  "mcpServers": {
-    "solidworks": {
-      "command": "C:\\mcp\\solidworks-mcp\\.venv\\Scripts\\python.exe",
-      "args": ["C:\\mcp\\solidworks-mcp\\server.py"]
-    }
-  }
+"solidworks": {
+  "command": "C:\\mcp\\solidworks-mcp\\.venv\\Scripts\\python.exe",
+  "args": ["C:\\mcp\\solidworks-mcp\\server.py"]
 }
 ```
 
-### Claude Code
+Claude Code:
 
 ```powershell
-claude mcp add solidworks -- C:\mcp\solidworks-mcp\.venv\Scripts\python.exe C:\mcp\solidworks-mcp\server.py
+claude mcp add solidworks --scope user -- C:\mcp\solidworks-mcp\.venv\Scripts\python.exe C:\mcp\solidworks-mcp\server.py
 ```
-
-SOLIDWORKS가 실행 중이면 그 창에 연결하고, 실행 중이 아니면 새로 띄웁니다.
-`도구 > 옵션 > 기본 템플릿`에 파트/어셈블리/도면 템플릿이 지정되어 있어야 `new_document`와 `make_drawing`이 동작합니다.
+</details>
 
 ## 예시 요청
 

@@ -18,6 +18,13 @@ user in Korean.
   without saving; the user keeps real files in `Desktop\sw_test`.
 - Commit style: imperative subject, body explains the observed failure and
   the fix. Push to `main`.
+- Install: `install.cmd` → `install.ps1` (venv, pip, registration, check);
+  `doctor.py` checks the setup and merges the Claude Desktop config
+  (`--register` / `--unregister`, backups, Store-app path too). Test the
+  installer on a copy of the repo with APPDATA/LOCALAPPDATA pointed at a
+  scratch folder, never against the real config. `.ps1` files must stay
+  UTF-8 *with* BOM (Windows PowerShell 5.1 misreads Korean otherwise) and
+  CRLF (`.gitattributes`).
 
 ## Hard-won rules (each one was a real bug)
 

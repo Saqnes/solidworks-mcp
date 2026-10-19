@@ -4669,6 +4669,12 @@ def run_macro(path: str, module: str, procedure: str) -> str:
 
 
 def main() -> None:
+    import sys
+
+    if any(a in sys.argv[1:] for a in ("--check", "--register", "--unregister")):
+        import doctor  # setup check / Claude Desktop registration, see doctor.py
+
+        sys.exit(doctor.main([a for a in sys.argv[1:] if a != "--check"]))
     mcp.run()
 
 
