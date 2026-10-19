@@ -45,29 +45,67 @@ user in Korean.
     work while a stuck call runs — usually a modal dialog in SOLIDWORKS.
 11. API units are metres/radians; tools take mm/degrees (`mm()`, `deg()`).
 12. Success must be checked, not assumed (export file mtime, built length
-    from GetPartBox, wizard hole position count, annotation counts).
+    from the body box, wizard hole position count, annotation counts).
+    Some setters return nothing even when they work
+    (Face.SetMaterialPropertyValues2): read the value back instead.
+13. **Selection marks** decide what an API call uses, and they are rarely
+    documented. Found by trying: angle plane = plane mark 0 + axis mark 1;
+    InsertDome = face mark 1; miter flange = profile sketch mark 0 + edges
+    mark 1; hole table = origin vertex mark 1 + face mark 2; component
+    pattern = definition created first, then components mark 1 + direction
+    mark 2. Pass marks with `CreateSelectData` + `Select4`.
+14. MathUtility.CreatePoint / MathPoint.MultiplyTransform must go through
+    `sw.invoke` (late binding reports "member not found" otherwise).
+15. While a drawing view is active, SketchManager coordinates are the
+    view's own sketch space (relative to the view, unscaled), not sheet
+    coordinates: map model points with `_to_sheet(view, p, sketch=True)`.
+16. Standard model view names are localized ("*등각 보기"): take them from
+    `GetModelViewNames` by position (`_model_view_names`).
+17. InsertCombineFeature takes swBodyOperationType_e (SWBODYADD/CUT/
+    INTERSECT); add/common want every body as a tool and no main body.
+    SketchUseEdge3's second argument means "inner loops only".
+    Tolerance.SetValues2 returns False here; SetValues works.
+18. With Windows' UTF-8 code page (ACP 65001) SOLIDWORKS' PDF export drops
+    every text run containing Korean; drawing PDFs are printed to
+    "Microsoft Print to PDF" instead (`export`, pdf_method).
 
 ## Verified on the real SOLIDWORKS
 
-sketch (+ design-intent dims, symmetry, 4X Ø prefix), extrude/cut, fillet,
-linear pattern, materials, equations/global variables, configurations,
-measure, make_drawing + PDF, export, export_folder, hole via Hole Wizard
-(counterbore, tapped with cosmetic thread, clearance without near-side
-countersink — `countersink diameter 0` variant worked), base flange via
-feature definition (one direction), sketch3d + tube sweep (outer
-diameter), engrave.
+Run on this PC (SOLIDWORKS 2025, Korean UI) through the server's own
+functions, each result checked (volumes, positions, PDFs rendered):
+
+- Parts: sketch (+ design-intent dims), extrude/cut (blind, through, up to
+  surface/plane, offset from surface, thin), fillet, linear pattern,
+  draft, dome, cosmetic_thread, angle_plane, sketch_from_face (convert,
+  offset), sketch_corners, combine_bodies (add/subtract/common),
+  move_body (move, copy), face_color, import_file (STEP), materials,
+  equations, configurations, measure, model_info (body box).
+- Holes: Hole Wizard counterbore, tapped (cosmetic thread), clearance,
+  all without the near-side countersink.
+- Sheet metal: base flange, edge_flange (90° and 60°), miter_flange along
+  two edges, hem.
+- Weldments: structural_member (iso square tube, mitre corners).
+- Assemblies: insert_component, add_mate (coincident, distance; faces
+  found through component bodies), list_mates, set_component,
+  component_pattern (linear, circular), exploded_view, replace_component.
+- Drawings: make_drawing with model dimensions and hole callouts,
+  drawing_view (isometric, exploded), section_view, detail_view,
+  projected_view, set_drawing_scale, drawing_note, center_marks,
+  add_dimension, set_tolerance, hole_table, title_block ("a3 - iso"),
+  bom_table, auto_balloons, drawing_sheets, export PDF (all sheets, Korean
+  text) and DXF.
 
 Macro recordings and argument tables: `docs/recordings/HANDOFF.md`.
 
-## Open items (as of commit after c3f763e)
+## Open items
 
-1. Retest drawing: hole callouts after the GetOutline fix
-   (`hole_callouts`, `callout_problems`), and why model dimensions stopped
-   importing (`dimensions_imported` is now reported; was 0 on bracket_hw).
-2. `open_document` on an already-open file now activates it — retest.
-3. Hole position dimensions in drawings are missing (wizard placement
-   sketch points have no dimensions).
-4. Unverified on real SOLIDWORKS: revolve, chamfer, circular_pattern,
-   mirror, shell, loft (once ok), rib, assemblies (insert_component,
-   add_mate, check_interference, bom), set_color, export_flat_pattern
-   options, Hole Wizard sizes other than the recorded ones (M8 worked).
+1. Hole position dimensions in drawings are missing (wizard placement
+   sketch points have no dimensions); add_dimension with entity "center"
+   is the workaround.
+2. Weldments: members are not trimmed against each other yet (no
+   trim/extend, end caps or gussets); cut list table not exposed.
+3. Not rechecked on the real SOLIDWORKS: revolve, chamfer,
+   circular_pattern, mirror, shell, loft, rib, check_interference,
+   export_flat_pattern options, Hole Wizard sizes other than M4/M6/M8.
+4. Drawings: no GD&T (datums, geometric tolerances, surface finish),
+   revision table, broken-out or auxiliary views yet.

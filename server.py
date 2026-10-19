@@ -376,7 +376,10 @@ VIEWS = {"front": 1, "back": 2, "left": 3, "right": 4, "top": 5, "bottom": 6, "i
 def _body_box(doc: Any) -> list[float] | None:
     """Box (m) around the part's solid bodies; GetPartBox also counts
     sketches and reference geometry."""
-    boxes = [b.GetBodyBox() for b in doc.GetBodies2(0, True) or ()]
+    try:
+        boxes = [b.GetBodyBox() for b in doc.GetBodies2(0, True) or ()]
+    except Exception:
+        boxes = []  # bodies that cannot report a box: fall back to the part box
     if not boxes:
         return doc.GetPartBox(True)
     return [min(b[i] for b in boxes) for i in range(3)] + [max(b[i] for b in boxes) for i in range(3, 6)]
@@ -981,33 +984,61 @@ def sketch(entities: list[dict], plane: str = "front", face_point: list[float] |
     return result
 
 
-END_CONDITIONS = {"blind": 0, "through_all": 1, "up_to_next": 2, "mid_plane": 6}
+END_CONDITIONS = {"blind": 0, "through_all": 1, "up_to_next": 2, "mid_plane": 6,
+                  "up_to_surface": 4, "offset_from_surface": 5}  # swEndConditions_e
 
 
 @tool
 def extrude(
     depth: float = 10.0,
     sketch_name: str = "",
-    end: Literal["blind", "through_all", "up_to_next", "mid_plane"] = "blind",
+    end: Literal["blind", "through_all", "up_to_next", "mid_plane", "up_to_surface", "offset_from_surface"] = "blind",
     reverse: bool = False,
     cut: bool = False,
     depth2: float = 0.0,
     draft_angle: float = 0.0,
     merge: bool = True,
+    face_point: list[float] | None = None,
+    up_to_plane: str = "",
+    thin: float = 0.0,
+    thin_reverse: bool = False,
 ) -> dict:
     """Boss-extrude (or cut-extrude with cut=true) a sketch, default the most
     recent one. depth2 > 0 also extrudes blind in the opposite direction;
-    mid_plane splits `depth` evenly about the sketch plane."""
+    mid_plane splits `depth` evenly about the sketch plane. up_to_surface
+    stops at the face through face_point ([x,y,z] mm; it must cover the
+    profile) or at the plane up_to_plane (a name or "front"/"top"/"right");
+    offset_from_surface stops `depth` mm short of it. thin > 0 makes a thin feature with that
+    wall thickness (mm) instead of a solid: an open profile becomes a wall,
+    a closed one a hollow tube (thin_reverse puts the wall on the other side)."""
     doc = sw.active_doc(DOC_PART)
+    if end in ("up_to_surface", "offset_from_surface") and not (face_point or up_to_plane):
+        raise ValueError(f"end={end!r} needs face_point (a point on the face) or up_to_plane")
     doc.ClearSelection2(True)
     name = sketch_name or sw.last_feature_of_type(doc, "ProfileFeature").Name
     sw.select_feature(doc, name)
+    if end in ("up_to_surface", "offset_from_surface"):  # the end face or plane with mark 1
+        if up_to_plane:
+            key = up_to_plane.lower()
+            target = sw.standard_plane(doc, key) if key in sw.PLANE_NAMES else sw.feature(doc, up_to_plane)
+            target.Select2(True, 1)
+        else:
+            sw.select_at(doc, "FACE", face_point, True, 1)
     fm = doc.FeatureManager
     single = depth2 <= 0
     t1, d1 = END_CONDITIONS[end], mm(depth)
     t2, d2 = 0, mm(depth2)
     draft = draft_angle != 0
     da = deg(abs(draft_angle))
+    if thin > 0:
+        head = (single, False, reverse, t1, t2, d1, d2, draft, draft, draft_angle < 0, draft_angle < 0, da, da,
+                False, False, False, False)
+        wall = (mm(thin), 0, 0, thin_reverse, False, False, 0)  # one-direction wall, no caps
+        if cut:
+            feat = fm.FeatureCutThin2(*head, *wall, True, True, 0, 0, False)
+        else:
+            feat = fm.FeatureExtrusionThin2(*head, merge, *wall, True, True, 0, 0, False)
+        return _feature_result(feat, "thin cut" if cut else "thin extrude")
     if cut:
         feat = fm.FeatureCut4(
             single, False, reverse, t1, t2, d1, d2, draft, draft, draft_angle < 0, draft_angle < 0, da, da,
@@ -1910,6 +1941,153 @@ def set_tolerance(
     return out
 
 
+def _view_entity(view: Any, point_mm: list[float], kind: str) -> Any:
+    """The edge or vertex shown in a view that is nearest a model point;
+    kind "center" is the circular edge whose centre is nearest (a hole)."""
+    types = {"edge": sw.constant("swViewEntityType_Edge"), "vertex": sw.constant("swViewEntityType_Vertex")}
+    p = tuple(mm(c) for c in point_mm)
+    best, best_d = None, math.inf
+    for ent in view.GetVisibleEntities2(sw.nothing(), types["edge" if kind == "center" else kind]) or ():
+        try:
+            if kind == "vertex":
+                q = sw.m0(ent, "GetPoint")
+            elif kind == "center":
+                curve = sw.m0(ent, "GetCurve")
+                if not sw.invoke(curve, "IsCircle"):
+                    continue
+                q = curve.CircleParams[:3]
+            else:
+                q = ent.GetClosestPointOn(*p)
+        except Exception:
+            continue
+        d = math.dist(p, tuple(q[:3]))
+        if d < best_d:
+            best, best_d = ent, d
+    if best is None or best_d > sw.TOLERANCE:
+        raise LookupError(f"No {kind} of {view.Name} within 0.5 mm of {point_mm} mm")
+    return best
+
+
+@tool
+def add_dimension(
+    point1: list[float],
+    point2: list[float] | None = None,
+    entity1: Literal["edge", "vertex", "center"] = "edge",
+    entity2: Literal["edge", "vertex", "center"] = "edge",
+    view: str = "",
+    direction: Literal["aligned", "horizontal", "vertical"] = "aligned",
+    position: list[float] | None = None,
+) -> dict:
+    """Add a dimension to a drawing view (default the first) on model
+    geometry picked by model points ([x,y,z] mm): one edge (its length, or
+    a circle's diameter) or the distance between two edges/vertices.
+    entity "center" picks the hole (circular edge) centred at the point, for
+    centre-to-centre distances.
+    direction forces a horizontal or vertical distance; position is the
+    dimension text on the sheet (mm), default just beside the view."""
+    drw = sw.active_doc(DOC_DRAWING)
+    target = _drawing_view(drw, view)
+    first = _view_entity(target, point1, entity1)
+    second = _view_entity(target, point2, entity2) if point2 else None
+    drw.ActivateView(target.Name)
+    drw.ClearSelection2(True)
+    _view_pick(drw, target, first, 0, False)
+    if second is not None:
+        _view_pick(drw, target, second, 0, True)
+    if position:
+        x, y = mm(position[0]), mm(position[1])
+    else:  # above the midpoint of what is measured, outside the view
+        pts = [_to_sheet(target, point1)] + ([_to_sheet(target, point2)] if point2 else [])
+        x1, y1, x2, y2 = sw.m0(target, "GetOutline")
+        stack = 0.008 + 0.007 * _dimension_count(target)  # one row further out per dimension
+        x = sum(p[0] for p in pts) / len(pts)
+        y = y2 + stack
+        if direction == "vertical":
+            x, y = x1 - stack, sum(p[1] for p in pts) / len(pts)
+    add = {"aligned": "AddDimension2", "horizontal": "AddHorizontalDimension2", "vertical": "AddVerticalDimension2"}[direction]
+    app = sw.app()
+    prompt = app.GetUserPreferenceToggle(INPUT_DIM_ON_CREATE)
+    app.SetUserPreferenceToggle(INPUT_DIM_ON_CREATE, False)  # no "Modify" dialog
+    try:
+        dim = getattr(drw, add)(x, y, 0)
+    finally:
+        app.SetUserPreferenceToggle(INPUT_DIM_ON_CREATE, prompt)
+    drw.ClearSelection2(True)
+    if dim is None:
+        raise RuntimeError("SOLIDWORKS did not add the dimension; check the picked geometry")
+    d = dim.GetDimension2(0)
+    return {"dimension": "@".join(d.FullName.split("@")[:2]), "value_mm": round(d.Value, 4), "view": target.Name}
+
+
+def _dimension_count(view: Any) -> int:
+    n, dd = 0, sw.m0(view, "GetFirstDisplayDimension5")
+    while dd is not None:
+        n += 1
+        dd = sw.m0(dd, "GetNext5")
+    return n
+
+
+@tool
+def projected_view(view: str = "", side: Literal["right", "left", "top", "bottom"] = "right",
+                   position: list[float] | None = None) -> dict:
+    """Add a view projected from a drawing view (default the first) to its
+    right/left/top/bottom, aligned with it. position is its centre on the
+    sheet (mm); by default the nearest free spot on that side."""
+    drw = sw.active_doc(DOC_DRAWING)
+    parent = _drawing_view(drw, view)
+    x1, y1, x2, y2 = sw.m0(parent, "GetOutline")
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    sheet_w, sheet_h = _sheet_size(drw)
+    if position:
+        x, y = mm(position[0]), mm(position[1])
+    else:
+        w, h, gap = x2 - x1, y2 - y1, 0.02
+        x, y = {"right": (x2 + gap + w / 2, cy), "left": (x1 - gap - w / 2, cy),
+                "top": (cx, y2 + gap + h / 2), "bottom": (cx, y1 - gap - h / 2)}[side]
+        if not (0 < x < sheet_w and 0 < y < sheet_h):
+            raise ValueError(f"No room {side} of {parent.Name} on the sheet; move the view (or pass position) first")
+    drw.ClearSelection2(True)
+    drw.Extension.SelectByID2(parent.Name, "DRAWINGVIEW", 0, 0, 0, False, 0, sw.nothing(), 0)
+    new = drw.CreateUnfoldedViewAt3(x, y, 0, False)
+    drw.ClearSelection2(True)
+    if new is None:
+        raise RuntimeError("SOLIDWORKS did not create the projected view")
+    drw.ForceRebuild3(False)
+    if not position:  # landed on another view: slide it further out on the same side
+        nx1, ny1, nx2, ny2 = sw.m0(new, "GetOutline")
+        ncx, ncy = (nx1 + nx2) / 2, (ny1 + ny2) / 2
+        nx, ny = _free_spot(drw, nx2 - nx1, ny2 - ny1, exclude=new.Name, near=(ncx, ncy),
+                            axis="x" if side in ("right", "left") else "y")
+        on_side = {"right": nx > cx, "left": nx < cx, "top": ny > cy, "bottom": ny < cy}[side]
+        if (nx, ny) != (ncx, ncy) and on_side:
+            new.Position = sw.doubles([new.Position[0] + nx - ncx, new.Position[1] + ny - ncy])
+            drw.ForceRebuild3(False)
+    return _view_info(new)
+
+
+@tool
+def drawing_sheets(add: str = "", activate: str = "", sheet_format: str = "", scale: str = "") -> dict:
+    """List the drawing's sheets; add one (named `add`, same paper as the
+    current sheet, optionally another sheet_format such as "a3 - iso" and
+    scale "1:2") or activate one. New views go on the active sheet; a PDF
+    export contains every sheet."""
+    drw = sw.active_doc(DOC_DRAWING)
+    if add:
+        cur = sw.m0(drw, "GetCurrentSheet")
+        paper, _, s1, s2, first_angle, w, h = list(sw.m0(cur, "GetProperties2"))[:7]
+        if scale:
+            s1, s2 = _parse_scale(scale)
+        template = _sheet_format_path(sheet_format) if sheet_format else (sw.m0(cur, "GetTemplateName") or "")
+        kind = 12 if template else 13  # swDwgTemplateCustom / swDwgTemplateNone
+        if not drw.NewSheet4(add, int(paper), kind, s1, s2, bool(first_angle), template, w, h, "Default",
+                             0, 0, 0, 0, 0, 0):
+            raise RuntimeError(f"Could not add sheet {add!r}")
+    if activate and not drw.ActivateSheet(activate):
+        raise LookupError(f"No sheet {activate!r}")
+    return {"sheets": list(sw.m0(drw, "GetSheetNames") or ()),
+            "active": sw.m0(sw.m0(drw, "GetCurrentSheet"), "GetName")}
+
+
 # --- Patterns, reference geometry and other features ------------------------
 
 # COM errors meaning "this API has a different signature here": bad parameter
@@ -2281,6 +2459,112 @@ def combine_bodies(operation: Literal["add", "subtract", "common"], main_body_po
     result = _feature_result(feat, f"combine ({operation})")
     result["bodies_before"], result["bodies_after"] = before, len(doc.GetBodies2(0, True) or ())
     return result
+
+
+@tool
+def import_file(path: str) -> dict:
+    """Open a neutral CAD file (.step/.stp, .igs/.iges, .x_t/.x_b, .sat,
+    .stl) as a new SOLIDWORKS part or assembly. Save it afterwards with
+    save(path=...sldprt) to keep it."""
+    target = str(Path(path))
+    if not os.path.exists(target):
+        raise FileNotFoundError(target)
+    app = sw.app()
+    data = sw.invoke(app, "GetImportFileData", target)
+    errors = sw.out_int()
+    doc = app.LoadFile4(target, "r", data, errors)
+    if doc is None:
+        raise RuntimeError(f"Import failed (swFileLoadError {errors.value}) for {target}")
+    info = sw.doc_info(doc)
+    if sw.m0(doc, "GetType") == DOC_PART:
+        info["bodies"] = len(doc.GetBodies2(0, True) or ())
+    elif sw.m0(doc, "GetType") == DOC_ASSEMBLY:
+        info["components"] = len(doc.GetComponents(True) or ())
+    return info
+
+
+@tool
+def sketch_corners(corner_points: list[list[float]], radius: float = 0.0, chamfer: float = 0.0,
+                   sketch_name: str = "") -> dict:
+    """Round (radius mm) or bevel (chamfer mm, equal distances) corners of an
+    existing sketch (default the most recent), picked by their 2D sketch
+    coordinates [[x,y], ...] mm, like the coordinates given to sketch()."""
+    if (radius > 0) == (chamfer > 0):
+        raise ValueError("Give either radius or chamfer")
+    doc = sw.active_doc(DOC_PART)
+    feat = sw.feature(doc, sketch_name) if sketch_name else sw.last_feature_of_type(doc, "ProfileFeature")
+    sk = sw.m0(feat, "GetSpecificFeature2")
+    points = list(sw.m0(sk, "GetSketchPoints2") or ())
+    picked = []
+    for x, y in corner_points:
+        best = min(points, key=lambda p: math.hypot(p.X - mm(x), p.Y - mm(y)), default=None)
+        if best is None or math.hypot(best.X - mm(x), best.Y - mm(y)) > sw.TOLERANCE:
+            raise LookupError(f"No sketch corner at [{x}, {y}] mm in {feat.Name}")
+        picked.append(best)
+    sw.close_open_sketch(doc)
+    doc.ClearSelection2(True)
+    feat.Select2(False, 0)
+    sw.m0(doc, "EditSketch")
+    sm = doc.SketchManager
+    try:
+        doc.ClearSelection2(True)
+        for i, p in enumerate(picked):
+            p.Select4(i > 0, sw.nothing())
+        if radius > 0:
+            # keep the corner's constrained geometry (swConstrainedCornerKeepGeometry)
+            made = sm.CreateFillet(mm(radius), 1)
+        else:
+            made = sm.CreateChamfer(2, mm(chamfer), mm(chamfer))  # swSketchChamfer_DistanceEqual
+    finally:
+        doc.ClearSelection2(True)
+        sm.InsertSketch(True)
+    if not made:
+        raise RuntimeError("SOLIDWORKS could not round/bevel those corners (is the radius too big?)")
+    _rebuild(doc)
+    return {"sketch": feat.Name, "corners": len(picked), "radius_mm" if radius else "chamfer_mm": radius or chamfer}
+
+
+@tool
+def move_body(body_point: list[float], translate: list[float] | None = None, rotate: list[float] | None = None,
+              about: list[float] | None = None, copy: bool = False, copies: int = 1) -> dict:
+    """Move (or copy, copies times) the solid body through body_point
+    ([x,y,z] mm on its surface) by translate [dx,dy,dz] mm and/or rotate
+    [rx,ry,rz] degrees about the point `about` (default the origin)."""
+    doc = sw.active_doc(DOC_PART)
+    body = _body_at(doc, body_point)
+    dx, dy, dz = (mm(v) for v in (translate or [0, 0, 0]))
+    rx, ry, rz = (deg(v) for v in (rotate or [0, 0, 0]))
+    px, py, pz = (mm(v) for v in (about or [0, 0, 0]))
+    doc.ClearSelection2(True)
+    data = sw.m0(doc.SelectionManager, "CreateSelectData")
+    data.Mark = 1
+    body.Select2(False, data)
+    before = len(doc.GetBodies2(0, True) or ())
+    feat = doc.FeatureManager.InsertMoveCopyBody2(dx, dy, dz, 0, px, py, pz, rx, ry, rz, copy, copies if copy else 0)
+    doc.ClearSelection2(True)
+    result = _feature_result(feat, "copy body" if copy else "move body")
+    result["bodies"] = {"before": before, "after": len(doc.GetBodies2(0, True) or ())}
+    return result
+
+
+@tool
+def face_color(face_points: list[list[float]], rgb: list[int]) -> dict:
+    """Colour single faces of the active part (picked by points on them,
+    [[x,y,z], ...] mm), e.g. a machined face [180, 180, 190]."""
+    doc = sw.active_doc(DOC_PART)
+    r, g, b = (max(0, min(255, int(v))) / 255 for v in rgb)
+    done = 0
+    for p in face_points:
+        dist, face = sw.nearest(doc, "face", p)
+        if face is None or dist > sw.TOLERANCE:
+            raise LookupError(f"No face within 0.5 mm of {p} mm")
+        # red, green, blue, ambient, diffuse, specular, shininess, transparency, emission; this configuration
+        face.SetMaterialPropertyValues2(sw.doubles((r, g, b, 1, 1, 0.5, 0.4, 0, 0)), 1, sw.empty())  # returns nothing
+        now = sw.m0(face, "MaterialPropertyValues") or ()
+        if len(now) >= 3 and all(abs(now[i] - c) < 0.01 for i, c in enumerate((r, g, b))):
+            done += 1
+    sw.m0(doc, "GraphicsRedraw2")
+    return {"faces_coloured": done, "rgb": list(rgb)}
 
 
 # --- Equations, global variables and configurations -------------------------
@@ -3288,6 +3572,111 @@ def miter_flange(edge_points: list[list[float]], length: float, angle: float = 9
     return _feature_result(feat, "miter flange") | {"profile_plane": plane.Name}
 
 
+# --- Weldments ----------------------------------------------------------------
+
+
+def _profile_root() -> Path:
+    try:
+        folder = sw.app().GetUserPreferenceStringValue(29)  # swFileLocationsWeldmentProfiles
+    except Exception:
+        folder = ""
+    if folder and os.path.isdir(folder):
+        return Path(folder)
+    return Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "SOLIDWORKS" / "SOLIDWORKS 2025" / "Weldment Profiles"
+
+
+@tool
+def weldment_profiles(standard: str = "iso") -> dict:
+    """Structural profiles available for structural_member: profile types
+    per standard (iso, din, ansi, jis, gb, ...) and the sizes of each."""
+    root = _profile_root()
+    folder = next((d for d in root.iterdir() if d.is_dir() and d.name.lower() == standard.lower()), None) if root.exists() else None
+    if folder is None:
+        raise LookupError(f"No standard {standard!r} in {root}; have: {sorted(d.name for d in root.iterdir() if d.is_dir()) if root.exists() else []}")
+    app = sw.app()
+    out = {}
+    for f in sorted(folder.glob("*.sldlfp")):
+        out[f.stem] = list(sw.invoke(app, "GetConfigurationNames", str(f)) or ())
+    return {"standard": folder.name, "profiles": out}
+
+
+@tool
+def structural_member(
+    profile: str,
+    size: str,
+    standard: str = "iso",
+    sketch_name: str = "",
+    segment_points: list[list[float]] | None = None,
+    corner: Literal["miter", "butt1", "butt2", "none"] = "miter",
+    rotate: float = 0.0,
+) -> dict:
+    """Weldment structural member (e.g. profile "square tube", size
+    "40 x 40 x 4") along the lines of a 2D or 3D sketch (default the most
+    recent). segment_points ([[x,y,z], ...] model mm, one point on each
+    line) limits it to some lines; by default every line of the sketch is
+    used. corner sets the corner treatment where members meet; rotate turns
+    the profile about the path (deg). The part becomes a weldment; see
+    weldment_profiles for what is installed."""
+    import pythoncom
+    from win32com.client import VARIANT
+
+    doc = sw.active_doc(DOC_PART)
+    root = _profile_root()
+    folder = next((d for d in root.iterdir() if d.is_dir() and d.name.lower() == standard.lower()), None)
+    path = folder / f"{profile}.sldlfp" if folder else None
+    if path is None or not path.exists():
+        raise LookupError(f"No profile {profile!r} for {standard!r}; see weldment_profiles")
+    sizes = list(sw.invoke(sw.app(), "GetConfigurationNames", str(path)) or ())
+    if size not in sizes:
+        raise LookupError(f"No size {size!r} for {profile}; sizes: {sizes}")
+    if sketch_name:
+        feat = sw.feature(doc, sketch_name)
+    else:
+        feats = [f for f in sw.iter_features(doc) if sw.m0(f, "GetTypeName2") in ("ProfileFeature", "3DProfileFeature")]
+        if not feats:
+            raise LookupError("No sketch to place the member on; draw the path with sketch or sketch3d first")
+        feat = feats[-1]
+    sk = sw.m0(feat, "GetSpecificFeature2")
+    segments = [s for s in sw.m0(sk, "GetSketchSegments") or () if not sw.m0(s, "ConstructionGeometry")]
+    if segment_points:
+        chosen = []
+        for p in segment_points:
+            q = tuple(mm(v) for v in p)
+            seg = min(segments, key=lambda s: _segment_distance(s, sk, q))
+            if _segment_distance(seg, sk, q) > sw.TOLERANCE:
+                raise LookupError(f"No line of {feat.Name} within 0.5 mm of {p} mm")
+            chosen.append(seg)
+        segments = chosen
+    if not segments:
+        raise ValueError(f"{feat.Name} has no lines")
+    fm = doc.FeatureManager
+    if not any(sw.m0(f, "GetTypeName2") == "WeldmentFeature" for f in sw.iter_features(doc)):
+        sw.m0(fm, "InsertWeldmentFeature")  # the part becomes a weldment
+    group = sw.m0(fm, "CreateStructuralMemberGroup")
+    group.Segments = VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, segments)
+    group.ApplyCornerTreatment = corner != "none"
+    group.CornerTreatmentType = {"none": 0, "miter": 1, "butt1": 2, "butt2": 3}[corner]  # swSolidworksWeldmentEndCondOptions
+    group.Angle = deg(rotate)
+    before = len(doc.GetBodies2(0, True) or ())
+    member = fm.InsertStructuralWeldment5(str(path), 1, True, VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, [group]), size)
+    result = _feature_result(member, "structural member")
+    result.update(profile=f"{standard}/{profile} {size}", segments=len(segments),
+                  bodies_added=len(doc.GetBodies2(0, True) or ()) - before)
+    return result
+
+
+def _segment_distance(seg: Any, sk: Any, point: tuple) -> float:
+    """Distance (m) from a model point to a sketch line."""
+    a = sw.m0(seg, "GetStartPoint2")
+    b = sw.m0(seg, "GetEndPoint2")
+    to_model = sw.m0(sw.m0(sk, "ModelToSketchTransform"), "Inverse")
+    pa, pb = _transform_points(to_model, [(a.X, a.Y, a.Z), (b.X, b.Y, b.Z)])
+    ab = [pb[i] - pa[i] for i in range(3)]
+    ap = [point[i] - pa[i] for i in range(3)]
+    t = max(0.0, min(1.0, sum(ab[i] * ap[i] for i in range(3)) / (sum(c * c for c in ab) or 1)))
+    return math.dist(point, tuple(pa[i] + t * ab[i] for i in range(3)))
+
+
 # --- Assembly management ----------------------------------------------------
 
 MATE_TYPES = {0: "coincident", 1: "concentric", 2: "perpendicular", 3: "parallel", 4: "tangent", 5: "distance",
@@ -3502,6 +3891,29 @@ def exploded_view(steps: list[dict], show: bool = True) -> dict:
     sw.m0(asm, "GraphicsRedraw2")
     return {"exploded_view": names[0] if names else None, "steps_added": made,
             "total_steps": sw.m0(cfg, "GetNumberOfExplodeSteps"), "shown": show}
+
+
+@tool
+def replace_component(name: str, path: str, all_instances: bool = False, configuration: str = "") -> dict:
+    """Swap an assembly component (name as in list_components) for another
+    part/assembly file, keeping its mates where the new geometry allows.
+    all_instances replaces every instance of the same file."""
+    asm = sw.active_doc(DOC_ASSEMBLY)
+    comp = _component(asm, name)
+    target = str(Path(path))
+    if not os.path.exists(target):
+        raise FileNotFoundError(target)
+    old = sw.m0(comp, "GetPathName")
+    asm.ClearSelection2(True)
+    _pick(asm, comp, 0, False)
+    # configuration: by name match unless one is given; re-attach mates
+    ok = asm.ReplaceComponents2(target, configuration, all_instances, 1 if configuration else 0, True)
+    asm.ClearSelection2(True)
+    if not ok:
+        raise RuntimeError(f"SOLIDWORKS did not replace {name} with {target}")
+    sw.m0(asm, "EditRebuild3")
+    now = [c.Name2 for c in asm.GetComponents(True) or () if os.path.normcase(sw.m0(c, "GetPathName") or "") == os.path.normcase(target)]
+    return {"replaced": name, "old_file": old, "new_file": target, "components_now": now}
 
 
 # --- Escape hatches -------------------------------------------------------

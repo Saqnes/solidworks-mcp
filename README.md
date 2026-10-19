@@ -10,19 +10,20 @@ SOLIDWORKS 2025 SP2 기준으로 작성했습니다.
 
 | 분류 | 도구 |
 |---|---|
-| 문서 | `status`, `list_documents`, `new_document`, `open_document`, `activate_document`, `save`, `export`, `close_document` |
+| 문서 | `status`, `list_documents`, `new_document`, `open_document`, `import_file`(STEP·IGES·Parasolid 등 가져오기), `activate_document`, `save`, `export`, `close_document` |
 | 확인 | `list_features`, `list_dimensions`, `model_info`(질량·부피·무게중심·바운딩박스·재질), `screenshot`(뷰 방향 지정 가능) |
 | 수정 | `set_dimension`, `rebuild`, `undo`, `delete_feature`, `suppress_feature`, `list_materials`, `set_material`, `custom_properties` |
-| 파트 모델링 | `sketch`(선·중심선·사각형·원·호·다각형·슬롯·점·타원·스플라인·글자, 평면 또는 면 위, 설계 의도 치수·대칭 구속 자동), `extrude`(보스/컷, 블라인드·관통·중간평면·구배), `revolve`, `fillet`, `chamfer`, `shell`, `draft`(중립면 구배), `dome`, `sketch_from_face`(면 윤곽 요소 변환·오프셋), `list_bodies`, `combine_bodies`(멀티바디 더하기·빼기·공통) |
+| 파트 모델링 | `sketch`(선·중심선·사각형·원·호·다각형·슬롯·점·타원·스플라인·글자, 평면 또는 면 위, 설계 의도 치수·대칭 구속 자동), `extrude`(보스/컷, 블라인드·관통·중간평면·면/평면까지·면에서 오프셋·구배·얇은 피처), `sketch_corners`(스케치 모서리 필렛·모따기), `revolve`, `fillet`, `chamfer`, `shell`, `draft`(중립면 구배), `dome`, `sketch_from_face`(면 윤곽 요소 변환·오프셋), `list_bodies`, `combine_bodies`(멀티바디 더하기·빼기·공통), `move_body`(바디 이동·회전·복사) |
 | 구멍·각인 | `hole`(Hole Wizard: ISO M2~M20 관통·탭·카운터보어·카운터싱크, 여러 위치 한 번에, 나사산 표시), `cosmetic_thread`(축·구멍에 나사산 표시), `engrave`(글자 각인·양각) |
 | 스윕·로프트 | `sketch3d`(3D 경로), `sweep`(단면 또는 원형 파이프·튜브, 컷 가능), `loft`(가이드 커브, 컷 가능), `rib` |
+| 용접 구조물 | `weldment_profiles`(설치된 형강 종류·크기), `structural_member`(스케치 선을 따라 각관·파이프·채널 등, 모서리 마이터/맞대기) |
 | 판금 | `sheet_metal_base_flange`, `edge_flange`(모서리 플랜지, 길이·각도 지정), `miter_flange`(이어진 모서리를 따라 도는 플랜지), `hem`(닫힘·열림·물방울·롤·이중 헴), `flatten`(펼치기/접기), `export_flat_pattern`(전개도 DXF, 벤드 라인 포함) |
 | 패턴·참조 | `linear_pattern`, `circular_pattern`, `mirror`, `offset_plane`, `angle_plane`(축을 지나는 각도 평면), `reference_axis` |
 | 설계 변수 | `list_equations`, `set_equation`(전역 변수·치수 연결), `delete_equation`, `configurations` |
 | 검사 | `measure`(거리·각도·길이·면적·지름), `check_interference`(어셈블리 간섭), `bom`(부품 수량표) |
-| 기타 | `set_color`, `export_folder`(폴더 일괄 STEP/STL 등 변환) |
-| 어셈블리 | `insert_component`, `list_components`, `add_mate`(일치·동심·거리·각도 등), `list_mates`, `set_component`(고정/유동·숨기기·억제·이동), `component_pattern`(부품 직선·원형 패턴), `exploded_view`(분해 단계) |
-| 도면 | `make_drawing`(3도 투상, 모델 치수·Hole Wizard 구멍 표기 자동), `add_hole_callouts`, `list_views`, `drawing_view`(등각 등 모델 뷰, 분해 상태 표시 가능), `section_view`(단면도), `detail_view`(상세도), `set_drawing_scale`, `drawing_note`, `center_marks`, `bom_table`, `auto_balloons`, `hole_table`(구멍 표), `title_block`(시트 형식 적용·표제란 속성 입력), `set_tolerance`(대칭·양방향·한계·맞춤 공차) → `export`로 PDF/DXF |
+| 기타 | `set_color`, `face_color`(면 단위 색상), `export_folder`(폴더 일괄 STEP/STL 등 변환) |
+| 어셈블리 | `insert_component`, `list_components`, `add_mate`(일치·동심·거리·각도 등), `list_mates`, `set_component`(고정/유동·숨기기·억제·이동), `component_pattern`(부품 직선·원형 패턴), `exploded_view`(분해 단계), `replace_component`(부품 교체) |
+| 도면 | `make_drawing`(3도 투상, 모델 치수·Hole Wizard 구멍 표기 자동), `add_hole_callouts`, `list_views`, `drawing_view`(등각 등 모델 뷰, 분해 상태 표시 가능), `section_view`(단면도), `detail_view`(상세도), `set_drawing_scale`, `drawing_note`, `center_marks`, `bom_table`, `auto_balloons`, `hole_table`(구멍 표), `title_block`(시트 형식 적용·표제란 속성 입력), `set_tolerance`(대칭·양방향·한계·맞춤 공차), `add_dimension`(뷰의 모서리·꼭짓점·구멍 중심에 치수), `projected_view`(투상도 추가), `drawing_sheets`(시트 추가·전환) → `export`로 PDF/DXF(모든 시트) |
 | 만능 | `run_api_script`(SOLIDWORKS API를 Python으로 직접 호출), `run_macro`(.swp 실행) |
 
 모서리나 면은 **그 위의 점 좌표(mm)**로 지정합니다. 예를 들어 50×30×10 박스의 위쪽 앞 모서리는 `[0, 10, 15]`입니다.
