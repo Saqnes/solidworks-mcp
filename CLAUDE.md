@@ -68,6 +68,19 @@ user in Korean.
 18. With Windows' UTF-8 code page (ACP 65001) SOLIDWORKS' PDF export drops
     every text run containing Korean; drawing PDFs are printed to
     "Microsoft Print to PDF" instead (`export`, pdf_method).
+19. Weldments and annotations, found by trying: InsertWeldmentTrimFeature(4)
+    with members mark 1 and boundary bodies mark 2 trims (other end
+    conditions and the ...2 variant make a feature that trims nothing —
+    check the volume); InsertGussetFeature2's BIsProfile True = polygon
+    (needs both chamfer legs > 0), False = triangle; InsertWeldmentTable
+    wants configuration "" (the view's "기본<가공 상태>" gives None) while
+    InsertBomTable4 needs the real name; InsertDatumTag2/InsertGtol are
+    parameterless (`sw.invoke`); IGtol.SetFrameSymbols takes swGcs/swMc
+    shorts (SetFrameSymbols2 wants text codes like "<GTOL-POSI>"); the
+    roughness value of a surface finish symbol is text slot
+    swSFSymbolRoughnessValue1; the Korean revision template has a title
+    row above the column headings and calls the description "비고".
+    Table positions are their anchor corner (`_table_box`).
 
 ## Verified on the real SOLIDWORKS
 
@@ -84,7 +97,8 @@ functions, each result checked (volumes, positions, PDFs rendered):
   all without the near-side countersink.
 - Sheet metal: base flange, edge_flange (90° and 60°), miter_flange along
   two edges, hem.
-- Weldments: structural_member (iso square tube, mitre corners).
+- Weldments: structural_member (iso square tube, mitre corners),
+  trim_members, end_cap, gusset (triangle, polygon), cut_list.
 - Assemblies: insert_component, add_mate (coincident, distance; faces
   found through component bodies), list_mates, set_component,
   component_pattern (linear, circular), exploded_view, replace_component.
@@ -92,8 +106,9 @@ functions, each result checked (volumes, positions, PDFs rendered):
   drawing_view (isometric, exploded), section_view, detail_view,
   projected_view, set_drawing_scale, drawing_note, center_marks,
   add_dimension, set_tolerance, hole_table, title_block ("a3 - iso"),
-  bom_table, auto_balloons, drawing_sheets, export PDF (all sheets, Korean
-  text) and DXF.
+  bom_table, auto_balloons, drawing_sheets, datum, geometric_tolerance,
+  surface_finish, revision_table, broken_out_section, auxiliary_view,
+  cut_list_table, export PDF (all sheets, Korean text) and DXF.
 
 Macro recordings and argument tables: `docs/recordings/HANDOFF.md`.
 
@@ -102,10 +117,10 @@ Macro recordings and argument tables: `docs/recordings/HANDOFF.md`.
 1. Hole position dimensions in drawings are missing (wizard placement
    sketch points have no dimensions); add_dimension with entity "center"
    is the workaround.
-2. Weldments: members are not trimmed against each other yet (no
-   trim/extend, end caps or gussets); cut list table not exposed.
+2. Weldments: the cut list table's description column ("비고") stays empty
+   with the Korean template (the cut list property is "설명").
 3. Not rechecked on the real SOLIDWORKS: revolve, chamfer,
    circular_pattern, mirror, shell, loft, rib, check_interference,
    export_flat_pattern options, Hole Wizard sizes other than M4/M6/M8.
-4. Drawings: no GD&T (datums, geometric tolerances, surface finish),
-   revision table, broken-out or auxiliary views yet.
+4. Drawings: no weld symbols, ordinate dimensions or break (shortened)
+   views yet.

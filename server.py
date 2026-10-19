@@ -1372,25 +1372,27 @@ def _free_spot(drw: Any, width: float, height: float, exclude: str = "",
     """Centre (m) of a free area of the given size on the sheet, clear of the
     views (and their annotations) by a gap; the free spot closest to `near`
     (default the sheet's top right). axis "x" keeps near's y (search along
-    x), "y" keeps near's x: for views SOLIDWORKS keeps aligned. Falls back to
-    the sheet's top right corner."""
+    x), "y" keeps near's x: for views SOLIDWORKS keeps aligned. When nothing
+    is free, the spot that overlaps the least."""
     sheet_w, sheet_h = _sheet_size(drw)
     boxes = [sw.m0(v, "GetOutline") for v in _drawing_views(drw) if v.Name != exclude] + list(extra or [])
     gap, step = 0.012, 0.005
     hw, hh = width / 2 + gap, height / 2 + gap
     target = near or (sheet_w, sheet_h)
-    best, best_d = None, math.inf
     ys = [target[1]] if axis == "x" else None
     xs = [target[0]] if axis == "y" else None
     y_vals = ys or [margin + height / 2 + i * step for i in range(int((sheet_h - 2 * margin - height) / step) + 1)]
     x_vals = xs or [margin + width / 2 + i * step for i in range(int((sheet_w - 2 * margin - width) / step) + 1)]
+    best, best_key = None, (math.inf, math.inf)
     for y in y_vals:
         for x in x_vals:
-            if all(x + hw <= b[0] or x - hw >= b[2] or y + hh <= b[1] or y - hh >= b[3] for b in boxes):
-                d = math.hypot(x - target[0], y - target[1])
-                if d < best_d:
-                    best, best_d = (x, y), d
-    return best or (sheet_w - margin - width / 2, sheet_h - margin - height / 2)
+            # overlap with the obstacles (0 = free), then distance to the target
+            overlap = sum(max(0.0, min(x + hw, b[2]) - max(x - hw, b[0])) * max(0.0, min(y + hh, b[3]) - max(y - hh, b[1]))
+                          for b in boxes)
+            key = (round(overlap, 9), math.hypot(x - target[0], y - target[1]))
+            if key < best_key:
+                best, best_key = (x, y), key
+    return best or (sheet_w - margin - width / 2, sheet_h - margin - height / 2)  # too big for the sheet
 
 
 def _parse_scale(scale: str) -> tuple[float, float]:
@@ -1618,22 +1620,37 @@ def _table_boxes(drw: Any) -> list[tuple[float, float, float, float]]:
     return out
 
 
+def _table_anchor(table: Any) -> int:
+    """swBOMConfigurationAnchorType_e: 1 top left, 2 top right, 3 bottom left, 4 bottom right."""
+    try:
+        return int(sw.m0(table, "AnchorType")) or 1
+    except Exception:
+        return 1
+
+
 def _table_box(table: Any) -> tuple[float, float, float, float]:
     w = sum(table.GetColumnWidth(i) for i in range(sw.m0(table, "ColumnCount")))
     h = sum(table.GetRowHeight(i) for i in range(sw.m0(table, "RowCount")))
-    x, y = list(sw.m0(sw.m0(table, "GetAnnotation"), "GetPosition"))[:2]  # top left with a top-left anchor
-    return (x, y - h, x + w, y)
+    x, y = list(sw.m0(sw.m0(table, "GetAnnotation"), "GetPosition"))[:2]  # the anchor corner
+    anchor = _table_anchor(table)
+    left = x if anchor in (1, 3) else x - w
+    top = y if anchor in (1, 2) else y + h
+    return (left, top - h, left + w, top)
 
 
 def _place_table(drw: Any, table: Any, others: list) -> list[float]:
-    """Move a table (anchored top left) to a free spot near the sheet's top
-    right, clear of views and other tables; returns its top left (mm)."""
+    """Move a table to a free spot near the sheet's top right, clear of
+    views and other tables; returns its top left (mm)."""
     x1, y1, x2, y2 = _table_box(table)
     w, h = x2 - x1, y2 - y1
     sheet_w, sheet_h = _sheet_size(drw)
     cx, cy = _free_spot(drw, w, h, near=(sheet_w, sheet_h), extra=others, margin=0.015)
-    sw.m0(table, "GetAnnotation").SetPosition2(cx - w / 2, cy + h / 2, 0)
-    return [round((cx - w / 2) / MM, 1), round((cy + h / 2) / MM, 1)]
+    left, top = cx - w / 2, cy + h / 2
+    anchor = _table_anchor(table)
+    ax = left if anchor in (1, 3) else left + w
+    ay = top if anchor in (1, 2) else top - h
+    sw.m0(table, "GetAnnotation").SetPosition2(ax, ay, 0)
+    return [round(left / MM, 1), round(top / MM, 1)]
 
 
 def _bom_template() -> str:
@@ -2086,6 +2103,287 @@ def drawing_sheets(add: str = "", activate: str = "", sheet_format: str = "", sc
         raise LookupError(f"No sheet {activate!r}")
     return {"sheets": list(sw.m0(drw, "GetSheetNames") or ()),
             "active": sw.m0(sw.m0(drw, "GetCurrentSheet"), "GetName")}
+
+
+def _annotation_spot(view: Any, point_mm: list[float], distance: float = 0.012) -> tuple[float, float]:
+    """A sheet position (m) just outside the view, beyond the side of its
+    outline nearest the model point, with room for earlier annotations."""
+    px, py = _to_sheet(view, point_mm)
+    x1, y1, x2, y2 = sw.m0(view, "GetOutline")
+    sides = {"left": px - x1, "right": x2 - px, "bottom": py - y1, "top": y2 - py}
+    side = min(sides, key=sides.get)
+    n = 0
+    ann = sw.m0(view, "GetFirstAnnotation3")
+    while ann is not None:
+        n += 1
+        ann = sw.m0(ann, "GetNext3")
+    d = distance + 0.004 * (n % 4)  # stagger so consecutive symbols do not sit on each other
+    return {"left": (x1 - d, py), "right": (x2 + d, py), "bottom": (px, y1 - d), "top": (px, y2 + d)}[side]
+
+
+def _attach(drw: Any, view: Any, point: list[float], entity: str) -> None:
+    ent = _view_entity(view, point, entity)
+    drw.ActivateView(view.Name)
+    drw.ClearSelection2(True)
+    _view_pick(drw, view, ent, 0, False)
+
+
+def _place(ann: Any, view: Any, point: list[float], position: list[float] | None) -> list[float]:
+    x, y = (mm(position[0]), mm(position[1])) if position else _annotation_spot(view, point)
+    ann.SetPosition2(x, y, 0)
+    return [round(x / MM, 1), round(y / MM, 1)]
+
+
+@tool
+def datum(label: str, point: list[float], view: str = "", entity: Literal["edge", "vertex"] = "edge",
+          position: list[float] | None = None) -> dict:
+    """Datum feature symbol (e.g. "A") on the model edge through `point`
+    ([x,y,z] mm) in a drawing view (default the first). position is the
+    symbol on the sheet (mm); by default just outside the view."""
+    drw = sw.active_doc(DOC_DRAWING)
+    target = _drawing_view(drw, view)
+    _attach(drw, target, point, entity)
+    tag = sw.invoke(drw, "InsertDatumTag2")
+    drw.ClearSelection2(True)
+    if tag is None:
+        raise RuntimeError("SOLIDWORKS did not insert the datum symbol")
+    tag.SetLabel(label)
+    at = _place(sw.m0(tag, "GetAnnotation"), target, point, position)
+    sw.m0(drw, "GraphicsRedraw2")
+    return {"datum": label, "view": target.Name, "position_mm": at}
+
+
+GTOL_SYMBOLS = {
+    "straightness": "swGcsSTRAIGHT", "flatness": "swGcsFLAT", "circularity": "swGcsROUND",
+    "cylindricity": "swGcsCYL", "line_profile": "swGcsLINEPROF", "surface_profile": "swGcsSURFPROF",
+    "angularity": "swGcsANG", "perpendicularity": "swGcsPERP", "parallelism": "swGcsPARALLEL",
+    "position": "swGcsPOSITION", "concentricity": "swGcsCONC", "symmetry": "swGcsSYMMETRY",
+    "circular_runout": "swGcsCIRCRUNOUT", "total_runout": "swGcsTOTALRUNOUT",
+}
+
+
+@tool
+def geometric_tolerance(
+    symbol: Literal["straightness", "flatness", "circularity", "cylindricity", "line_profile", "surface_profile",
+                    "angularity", "perpendicularity", "parallelism", "position", "concentricity", "symmetry",
+                    "circular_runout", "total_runout"],
+    tolerance: float,
+    point: list[float],
+    datums: list[str] | None = None,
+    diameter: bool = False,
+    material_condition: Literal["", "MMC", "LMC"] = "",
+    view: str = "",
+    entity: Literal["edge", "vertex", "center"] = "edge",
+    position: list[float] | None = None,
+) -> dict:
+    """Geometric tolerance frame (e.g. flatness 0.05, or position Ø0.1 Ⓜ
+    to datums A and B) attached to the model edge through `point` ([x,y,z]
+    mm; entity "center" picks the hole centred there) in a drawing view
+    (default the first). position is the frame on the sheet (mm)."""
+    drw = sw.active_doc(DOC_DRAWING)
+    target = _drawing_view(drw, view)
+    _attach(drw, target, point, entity)
+    gtol = sw.invoke(drw, "InsertGtol")
+    drw.ClearSelection2(True)
+    if gtol is None:
+        raise RuntimeError("SOLIDWORKS did not insert the tolerance frame")
+    mc = {"": "swMcNONE", "MMC": "swMcMMC", "LMC": "swMcLMC"}[material_condition]
+    # the short-code variant; SetFrameSymbols2 wants the symbols as text codes
+    gtol.SetFrameSymbols(1, sw.constant(GTOL_SYMBOLS[symbol]), diameter, sw.constant(mc), False, 0, 0, 0, 0)
+    d = list(datums or []) + ["", "", ""]
+    gtol.SetFrameValues2(1, f"{tolerance:g}", "", d[0], d[1], d[2])
+    at = _place(sw.m0(gtol, "GetAnnotation"), target, point, position)
+    sw.m0(drw, "GraphicsRedraw2")
+    return {"symbol": symbol, "tolerance": tolerance, "datums": datums or [], "view": target.Name, "position_mm": at,
+            "frame": list(sw.invoke(gtol, "GetFrameSymbols3", 1) or ())[:2]}
+
+
+@tool
+def surface_finish(point: list[float], roughness: str = "Ra 1.6", kind: Literal["machined", "basic", "no_machining"] = "machined",
+                   view: str = "", position: list[float] | None = None) -> dict:
+    """Surface texture symbol with a roughness value (e.g. "Ra 1.6") on the
+    model edge through `point` ([x,y,z] mm) in a drawing view (default the
+    first). kind: machined (material removal required), basic, or
+    no_machining (removal not allowed)."""
+    drw = sw.active_doc(DOC_DRAWING)
+    target = _drawing_view(drw, view)
+    _attach(drw, target, point, "edge")
+    x, y = (mm(position[0]), mm(position[1])) if position else _annotation_spot(target, point, 0.015)
+    sym = {"basic": 0, "machined": 1, "no_machining": 2}[kind]  # swSFSymType_e
+    # symbol type, straight leader, position, no lay, arrow, then empty texts
+    sf = drw.Extension.InsertSurfaceFinishSymbol3(sym, 1, x, y, 0, 0, 1, "", "", "", "", "", "", "")
+    drw.ClearSelection2(True)
+    if sf is None:
+        raise RuntimeError("SOLIDWORKS did not insert the surface finish symbol")
+    sf.SetText(sw.constant("swSFSymbolRoughnessValue1"), roughness)  # the value under the symbol's bar
+    sw.m0(drw, "GraphicsRedraw2")
+    return {"roughness": roughness, "kind": kind, "view": target.Name, "position_mm": [round(x / MM, 1), round(y / MM, 1)]}
+
+
+@tool
+def revision_table(revision: str = "", description: str = "", approved: str = "") -> dict:
+    """Add a revision row (e.g. "A", "개정 내용") to the drawing's revision
+    table, creating the table at the sheet's top right first if there is
+    none. Without arguments it only lists the revisions."""
+    drw = sw.active_doc(DOC_DRAWING)
+    sheet = sw.m0(drw, "GetCurrentSheet")
+    table = sw.m0(sheet, "RevisionTable")
+    created = False
+    if table is None:
+        others = _table_boxes(drw)
+        sheet_w, sheet_h = _sheet_size(drw)
+        template = _table_template("standard revision block.sldrevtbt")
+        # top left anchor, circle revision symbols, update zone cells
+        table = sheet.InsertRevisionTable2(False, sheet_w - 0.2, sheet_h - 0.015, 1, template, 1, True)
+        if table is None:
+            raise RuntimeError("Could not insert a revision table")
+        _place_table(drw, table, others)
+        created = True
+    cols = sw.m0(table, "ColumnCount")
+    # the template may start with a title row ("수정본") above the column headings
+    head_row = next((r for r in range(min(3, sw.m0(table, "RowCount")))
+                     if sum(1 for c in range(cols) if (table.Text(r, c) or "").strip()) > 1), 0)
+    heads = [(table.Text(head_row, c) or "").strip().lower() for c in range(cols)]
+    if revision:
+        if not table.AddRevision(revision):
+            raise RuntimeError(f"Could not add revision {revision!r}")
+        row = sw.m0(table, "RowCount") - 1  # appended at the bottom
+        for col, head in enumerate(heads):
+            if description and any(k in head for k in ("설명", "비고", "description", "내용")):
+                _set_cell(table, row, col, description)
+            if approved and any(k in head for k in ("승인", "approved")):
+                _set_cell(table, row, col, approved)
+    drw.ForceRebuild3(False)
+    rows = [[table.Text(r, c) for c in range(cols)] for r in range(head_row + 1, sw.m0(table, "RowCount"))]
+    return {"created": created, "columns": [table.Text(head_row, c) for c in range(cols)], "revisions": rows}
+
+
+def _set_cell(table: Any, row: int, col: int, text: str) -> None:
+    """ITableAnnotation.Text(row, col) = text: an indexed property write."""
+    import pythoncom
+
+    dispid = table._oleobj_.GetIDsOfNames("Text")
+    table._oleobj_.Invoke(dispid, 0, pythoncom.DISPATCH_PROPERTYPUT, False, row, col, text)
+
+
+@tool
+def broken_out_section(center: list[float], radius: float, depth: float, view: str = "") -> dict:
+    """Broken-out (partial) section: cut away a circular region of `radius`
+    mm around a model point ([x,y,z] mm) in a drawing view (default the
+    first), `depth` mm deep from the front of the view, to show what is
+    inside."""
+    drw = sw.active_doc(DOC_DRAWING)
+    target = _drawing_view(drw, view)
+    cx, cy = _to_sheet(target, center, sketch=True)
+    drw.ActivateView(target.Name)
+    drw.ClearSelection2(True)
+    circle = drw.SketchManager.CreateCircleByRadius(cx, cy, 0, mm(radius))
+    if circle is None:
+        raise RuntimeError("Could not draw the section outline")
+    drw.ClearSelection2(True)
+    circle.Select4(False, sw.nothing())
+    before = sw.m0(target, "GetBreakOutSectionCount")
+    sw.invoke(drw, "CreateBreakOutSection", mm(depth))
+    drw.ClearSelection2(True)
+    drw.ForceRebuild3(False)
+    if sw.m0(target, "GetBreakOutSectionCount") <= before:
+        raise RuntimeError("SOLIDWORKS did not create the broken-out section; is the depth inside the part?")
+    return {"view": target.Name, "broken_out_sections": sw.m0(target, "GetBreakOutSectionCount")}
+
+
+@tool
+def auxiliary_view(edge_point: list[float], view: str = "", label: str = "C",
+                   position: list[float] | None = None) -> dict:
+    """Auxiliary view looking square onto an inclined face: projected
+    perpendicular to the model edge through edge_point ([x,y,z] mm) as seen
+    in a drawing view (default the first). position is its centre on the
+    sheet (mm); by default a free spot on the side the edge faces."""
+    drw = sw.active_doc(DOC_DRAWING)
+    target = _drawing_view(drw, view)
+    edge = _view_entity(target, edge_point, "edge")
+    drw.ActivateView(target.Name)
+    drw.ClearSelection2(True)
+    _view_pick(drw, target, edge, 0, False)
+    x1, y1, x2, y2 = sw.m0(target, "GetOutline")
+    # the view is projected perpendicular to the edge, away from the parent view
+    px, py = _to_sheet(target, edge_point)
+    try:
+        ends = [_to_sheet(target, [c / MM for c in sw.m0(sw.m0(edge, v), "GetPoint")]) for v in ("GetStartVertex", "GetEndVertex")]
+        ex, ey = ends[1][0] - ends[0][0], ends[1][1] - ends[0][1]
+        nx, ny = -ey, ex
+    except Exception:  # no end vertices: fall back to "away from the view centre"
+        nx, ny = px - (x1 + x2) / 2, py - (y1 + y2) / 2
+    k = math.hypot(nx, ny) or 1
+    nx, ny = nx / k, ny / k
+    if nx * (px - (x1 + x2) / 2) + ny * (py - (y1 + y2) / 2) < 0:
+        nx, ny = -nx, -ny
+    if position:
+        x, y = mm(position[0]), mm(position[1])
+    else:
+        reach = 0.02 + max(x2 - x1, y2 - y1) / 2
+        x, y = px + nx * reach, py + ny * reach
+    new = drw.CreateAuxiliaryViewAt2(x, y, 0, False, label, True, False)
+    drw.ClearSelection2(True)
+    if new is None:
+        raise RuntimeError("SOLIDWORKS did not create the auxiliary view; pick a straight edge")
+    drw.ForceRebuild3(False)
+    if not position:  # slide it out along the projection direction until it is clear
+        sheet_w, sheet_h = _sheet_size(drw)
+        others = [sw.m0(v, "GetOutline") for v in _drawing_views(drw) if v.Name != new.Name] + _table_boxes(drw)
+
+        def clash() -> bool:
+            a1, b1, a2, b2 = sw.m0(new, "GetOutline")
+            return any(a2 + 0.01 > o[0] and a1 - 0.01 < o[2] and b2 + 0.01 > o[1] and b1 - 0.01 < o[3] for o in others)
+
+        for _ in range(80):
+            a1, b1, a2, b2 = sw.m0(new, "GetOutline")
+            if not clash() or a1 < 0 or b1 < 0 or a2 > sheet_w or b2 > sheet_h:
+                break
+            pos = new.Position
+            new.Position = sw.doubles([pos[0] + nx * 0.005, pos[1] + ny * 0.005])
+            drw.ForceRebuild3(False)
+        if clash():  # no room in line with the edge: recreate it unaligned in a free spot
+            a1, b1, a2, b2 = sw.m0(new, "GetOutline")
+            fx, fy = _free_spot(drw, a2 - a1, b2 - b1, exclude=new.Name, extra=_table_boxes(drw))
+            name = new.Name
+            drw.ClearSelection2(True)
+            drw.Extension.SelectByID2(name, "DRAWINGVIEW", 0, 0, 0, False, 0, sw.nothing(), 0)
+            drw.Extension.DeleteSelection2(0)
+            drw.ActivateView(target.Name)
+            drw.ClearSelection2(True)
+            _view_pick(drw, target, _view_entity(target, edge_point, "edge"), 0, False)
+            new = drw.CreateAuxiliaryViewAt2(fx, fy, 0, True, label, True, False)
+            drw.ClearSelection2(True)
+            if new is None:
+                raise RuntimeError("SOLIDWORKS did not recreate the auxiliary view off its alignment")
+            drw.ForceRebuild3(False)
+    return _view_info(new)
+
+
+@tool
+def cut_list_table(view: str = "", position: list[float] | None = None) -> dict:
+    """Weldment cut list table (item, quantity, description, length) for the
+    weldment part in a drawing view (default the first), at position (top
+    left, mm) or a free spot near the sheet's top right."""
+    drw = sw.active_doc(DOC_DRAWING)
+    target = _drawing_view(drw, view)
+    sheet_w, sheet_h = _sheet_size(drw)
+    x, y = (mm(position[0]), mm(position[1])) if position else (0.02, sheet_h - 0.02)
+    others = _table_boxes(drw)
+    drw.ActivateView(target.Name)
+    template = _table_template("cut list.sldwldtbt")
+    # unlike BOM tables, the view's configuration name ("기본<가공 상태>") gives nothing; "" works
+    table = (target.InsertWeldmentTable(False, x, y, 1, "", template)
+             or target.InsertWeldmentTable(False, x, y, 1, target.ReferencedConfiguration, template))
+    if table is None:
+        raise RuntimeError("Could not insert a cut list table; does the view show a weldment part?")
+    corner = [x / MM, y / MM] if position else _place_table(drw, table, others)
+    drw.ForceRebuild3(False)
+    try:
+        rows = sw.m0(table, "RowCount") - 1
+    except Exception:
+        rows = None
+    return {"rows": rows, "top_left_mm": corner}
 
 
 # --- Patterns, reference geometry and other features ------------------------
@@ -3675,6 +3973,128 @@ def _segment_distance(seg: Any, sk: Any, point: tuple) -> float:
     ap = [point[i] - pa[i] for i in range(3)]
     t = max(0.0, min(1.0, sum(ab[i] * ap[i] for i in range(3)) / (sum(c * c for c in ab) or 1)))
     return math.dist(point, tuple(pa[i] + t * ab[i] for i in range(3)))
+
+
+@tool
+def trim_members(trim_points: list[list[float]], boundary_points: list[list[float]]) -> dict:
+    """Trim weldment members where they run into others: the bodies through
+    trim_points ([[x,y,z], ...] mm, a point on each member's surface) are
+    cut back to the boundary bodies through boundary_points, keeping the
+    longer side (e.g. legs that poke into a frame)."""
+    doc = sw.active_doc(DOC_PART)
+    trim = [_body_at(doc, p) for p in trim_points]
+    bounds = [_body_at(doc, p) for p in boundary_points]
+    before = {b.Name: b.GetMassProperties(1.0)[3] for b in trim}
+    doc.ClearSelection2(True)
+    # members to trim with mark 1, the boundary with mark 2; end condition 4 trims to bodies
+    for i, b in enumerate(trim):
+        _pick_body(doc, b, 1, i > 0)
+    for b in bounds:
+        _pick_body(doc, b, 2, True)
+    feat = doc.FeatureManager.InsertWeldmentTrimFeature(4)
+    doc.ClearSelection2(True)
+    result = _feature_result(feat, "trim/extend")
+    _rebuild(doc)
+    after = sum(b.GetMassProperties(1.0)[3] for b in doc.GetBodies2(0, True) or () if sw.m0(feat, "Name") in b.Name)
+    removed = sum(before.values()) - after if after else 0
+    result["volume_removed_mm3"] = round(removed / MM**3, 1)
+    if removed <= 0:
+        result["warning"] = "nothing was trimmed; do the members actually overlap the boundary?"
+    return result
+
+
+def _pick_body(doc: Any, body: Any, mark: int, append: bool) -> bool:
+    data = sw.m0(doc.SelectionManager, "CreateSelectData")
+    data.Mark = mark
+    return bool(body.Select2(append, data))
+
+
+@tool
+def end_cap(face_points: list[list[float]], thickness: float = 3.0, inward: bool = False, chamfer: float = 0.0) -> dict:
+    """Close the open ends of weldment tubes with end caps `thickness` mm
+    thick. face_points are points on the end faces (the tube wall ring,
+    [[x,y,z], ...] mm). inward sinks the cap into the tube; chamfer bevels
+    its corners (mm)."""
+    doc = sw.active_doc(DOC_PART)
+    doc.ClearSelection2(True)
+    for i, p in enumerate(face_points):
+        sw.select_at(doc, "FACE", p, i > 0, 0)
+    before = len(doc.GetBodies2(0, True) or ())
+    feat = doc.FeatureManager.InsertEndCapFeature3(
+        mm(thickness), True, chamfer > 0, 0.0, 0.5, mm(chamfer), False, 0.0, False, inward)
+    doc.ClearSelection2(True)
+    result = _feature_result(feat, "end cap")
+    result["caps"] = len(doc.GetBodies2(0, True) or ()) - before
+    return result
+
+
+@tool
+def gusset(face1_point: list[float], face2_point: list[float], size1: float = 60.0, size2: float = 60.0,
+           thickness: float = 5.0, shape: Literal["triangle", "polygon"] = "triangle", chamfer: float = 15.0,
+           location: Literal["center", "start", "end"] = "center",
+           thickness_side: Literal["both", "inner", "outer"] = "both") -> dict:
+    """Gusset plate in the corner between two planar faces of a weldment
+    (points on each, [x,y,z] mm), size1 x size2 mm along them, `thickness`
+    mm thick. polygon cuts the outer corner off by `chamfer` mm on both
+    legs."""
+    import pythoncom
+    from win32com.client import VARIANT
+
+    doc = sw.active_doc(DOC_PART)
+    faces = []
+    for p in (face1_point, face2_point):
+        dist, face = sw.nearest(doc, "face", p)
+        if face is None or dist > sw.TOLERANCE:
+            raise LookupError(f"No face within 0.5 mm of {p} mm")
+        faces.append(face)
+    poly = shape == "polygon"
+    c = mm(chamfer) if poly else 0.0
+    side = {"inner": 0, "both": 1, "outer": 2}[thickness_side]  # swGussetThickness*
+    loc = {"start": 0, "center": 1, "end": 2}[location]  # swGussetProfileLocation*
+    before = len(doc.GetBodies2(0, True) or ())
+    doc.ClearSelection2(True)
+    # BIsProfile: True = polygon (needs both chamfer legs), False = triangle
+    feat = doc.FeatureManager.InsertGussetFeature2(
+        mm(thickness), side, loc, poly, mm(size1), mm(size2), c, math.pi / 4, c, False, 0.0, 0, False, False, False,
+        VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, faces))
+    result = _feature_result(feat, "gusset")
+    result["plates"] = len(doc.GetBodies2(0, True) or ()) - before
+    return result
+
+
+def _resolved(cpm: Any, name: str) -> str:
+    import pythoncom
+    from win32com.client import VARIANT
+
+    raw, value = sw.out_bstr(), sw.out_bstr()
+    was = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_BOOL, False)
+    cpm.Get5(name, False, raw, value, was)
+    return value.value
+
+
+@tool
+def cut_list() -> list[dict]:
+    """The weldment cut list of the active part: one entry per group of
+    identical members (description, quantity, length, end angles, total
+    length) plus other bodies such as gussets and end caps, refreshed
+    first."""
+    doc = sw.active_doc(DOC_PART)
+    out = []
+    for f in sw.iter_features(doc):
+        if sw.m0(f, "GetTypeName2") != "SolidBodyFolder":
+            continue
+        sw.m0(sw.m0(f, "GetSpecificFeature2"), "UpdateCutList")
+        sub = sw.m0(f, "GetFirstSubFeature")
+        while sub is not None:
+            if sw.m0(sub, "GetTypeName2") == "CutListFolder":
+                folder = sw.m0(sub, "GetSpecificFeature2")
+                cpm = sub.CustomPropertyManager
+                props = {n: _resolved(cpm, n) for n in sw.m0(cpm, "GetNames") or ()}
+                out.append({"item": sub.Name, "bodies": sw.m0(folder, "GetBodyCount"), "properties": props})
+            sub = sw.m0(sub, "GetNextSubFeature")
+    if not out:
+        raise LookupError("No cut list: is this a weldment (structural_member)?")
+    return out
 
 
 # --- Assembly management ----------------------------------------------------
