@@ -139,6 +139,27 @@ user in Korean.
     tab faces (a cylinder tab is refused alone and moves nothing when given
     twice). GetComponents order is not insertion order. Load errors are
     reported by name via `sw.load_error` (swFileLoadError_e + Korean hint).
+25. More found by trying: InsertHelix (on IModelDoc2, sketch with one
+    circle selected) and InsertReferencePoint return no feature — take the
+    newest "Helix"/"RefPoint" from the tree. Sketch driven pattern = seed
+    features mark 4 + point sketch mark 64. AddComponent5 puts the
+    component's *bounding box centre* at x, y, z, so insert_component sets
+    the transform afterwards (ArrayData[0:9] = the rotated X, Y, Z axes one
+    after another, [9:12] = origin). It also closes the part window that
+    OpenDoc6 opened for it: the model stays loaded for the assembly, and
+    the windows left open used to pile up. Slot/hinge/screw/rack-pinion
+    mates exist only as CreateMateData + CreateMate; the mate data object
+    only shows its members when made on the COM thread from
+    `sw.active_doc()`. Hinge and rack-pinion take EntitiesToMate as an
+    indexed property (`sw.put_indexed`); rack-pinion wants one plain object
+    per role (an array is a type mismatch). Drawing centerlines: select the
+    whole view (SelectByID2 name, "DRAWINGVIEW") and call InsertCenterLine2
+    (`sw.invoke`); it adds one per cylinder seen from the side, none for
+    hidden ones unless the view shows hidden lines. AlignDimensions
+    (AutoArrange) returned True and moved nothing on a clean layout, so no
+    tool uses it. After ~140 documents made and closed in one session
+    (9 GB), SOLIDWORKS answered every command with a modal "Windows
+    resources are very low" dialog; only a restart helps (`status` warns).
 
 ## Verified on the real SOLIDWORKS
 
@@ -156,7 +177,9 @@ functions, each result checked (volumes, positions, PDFs rendered):
   Countersink M2/M2.5 fall back to a sketch cut (ISO 10642 has no such
   sizes).
 - Also: revolve (+ cut), chamfer, shell, circular_pattern, mirror, loft,
-  rib, check_interference, export_flat_pattern bend lines, rename_feature.
+  rib, check_interference, export_flat_pattern bend lines, rename_feature,
+  helix (+ spring sweep), coordinate_system, sketch_pattern,
+  reference_point.
 - Sheet metal: base flange, edge_flange (90° and 60°), miter_flange along
   two edges, hem.
 - Weldments: structural_member (iso square tube, mitre corners),
@@ -165,7 +188,8 @@ functions, each result checked (volumes, positions, PDFs rendered):
   sketched_bend, mirror_components.
 - Assemblies: insert_component, add_mate (coincident, distance; faces
   found through component bodies; symmetric, width, gear, lock, limit
-  distance/angle), list_mates (limits), set_component,
+  distance/angle, slot, hinge, screw, rack_pinion), list_mates (limits),
+  insert_component/set_component (origin position, rotation),
   component_pattern (linear, circular), exploded_view, replace_component.
 - Drawings: make_drawing with model dimensions and hole callouts,
   drawing_view (isometric, exploded), section_view, detail_view,
@@ -174,8 +198,8 @@ functions, each result checked (volumes, positions, PDFs rendered):
   bom_table, auto_balloons, drawing_sheets, datum, geometric_tolerance,
   surface_finish, revision_table, broken_out_section, auxiliary_view,
   cut_list_table, weld_symbol, ordinate_dimensions, break_view,
-  dimension_holes, flat_pattern_view, export PDF (all sheets, Korean
-  text) and DXF.
+  dimension_holes, flat_pattern_view, view_style, centerlines, export
+  PDF (all sheets, Korean text) and DXF.
 - Files: edit_sketch, pack_and_go (prefix/suffix, drawings; reopened the
   packed assembly with the originals closed: every component loads from
   the copy).

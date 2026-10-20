@@ -60,7 +60,8 @@ def call(fn: Callable[[], T], timeout: float | None = None) -> T:
     except FutureTimeout:
         raise RuntimeError(
             f"SOLIDWORKS did not answer within {limit:.0f} s. A dialog may be waiting "
-            "in SOLIDWORKS; close it. The request may still finish in the background."
+            "in SOLIDWORKS; close it (a 'Windows resources are very low' warning means "
+            "SOLIDWORKS needs a restart). The request may still finish in the background."
         ) from None
 
 
@@ -309,6 +310,35 @@ def active_doc(kind: int | None = None) -> Any:
             f"this needs a {DOC_TYPE_NAMES[kind]}"
         )
     return doc
+
+
+def process_usage(pid: int) -> dict:
+    """Memory (MB) and GDI/USER object counts of a process. SOLIDWORKS
+    started to answer every command with a "Windows resources are very
+    low" dialog at about 9 GB after ~140 documents were made and closed."""
+    import ctypes
+    from ctypes import wintypes
+
+    class Counters(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+            (n, ctypes.c_size_t) for n in ("PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
+                                           "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage",
+                                           "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage")]
+
+    kernel32, user32 = ctypes.WinDLL("kernel32"), ctypes.WinDLL("user32")
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        raise OSError(f"Cannot open process {pid}")
+    try:
+        counters = Counters()
+        counters.cb = ctypes.sizeof(Counters)
+        kernel32.K32GetProcessMemoryInfo(wintypes.HANDLE(handle), ctypes.byref(counters), counters.cb)
+        return {"memory_mb": round(counters.WorkingSetSize / 2**20),
+                "gdi_objects": user32.GetGuiResources(wintypes.HANDLE(handle), 0),
+                "user_objects": user32.GetGuiResources(wintypes.HANDLE(handle), 1)}
+    finally:
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
 
 
 def doc_info(doc: Any) -> dict:

@@ -91,10 +91,22 @@ def _feature_result(feat: Any, what: str) -> dict:
 
 @tool
 def status() -> dict:
-    """SOLIDWORKS version and the active document, if any."""
+    """SOLIDWORKS version, the active document and how much memory and
+    Windows handles SOLIDWORKS uses (it slows down and finally blocks every
+    command with a "resources low" dialog when they run out)."""
     app = sw.app()
     doc = app.ActiveDoc
-    return {"revision": sw.m0(app, "RevisionNumber"), "active_document": sw.doc_info(doc) if doc else None}
+    result = {"revision": sw.m0(app, "RevisionNumber"), "active_document": sw.doc_info(doc) if doc else None,
+              "open_documents": len(sw.m0(app, "GetDocuments") or ())}
+    try:
+        usage = sw.process_usage(sw.m0(app, "GetProcessID"))
+    except Exception:
+        return result
+    result["solidworks_process"] = usage
+    if usage["memory_mb"] > 6000 or max(usage["gdi_objects"], usage["user_objects"]) > 7000:
+        result["warning"] = ("SOLIDWORKS is using a lot of memory/handles; save your work and restart it "
+                             "before long jobs (it froze behind a 'Windows resources low' dialog at ~9 GB)")
+    return result
 
 
 @tool
@@ -1138,8 +1150,10 @@ def chamfer(distance: float, edge_points: list[list[float]], angle: float = 45.0
 
 
 @tool
-def insert_component(path: str, position: list[float] | None = None) -> dict:
-    """Insert a part/assembly file into the active assembly at [x,y,z] mm."""
+def insert_component(path: str, position: list[float] | None = None, rotation: list[float] | None = None) -> dict:
+    """Insert a part/assembly file into the active assembly with its origin
+    at position [x,y,z] mm (default the assembly origin), turned by rotation
+    [about x, about y, about z] degrees (applied in that order)."""
     app = sw.app()
     asm = sw.active_doc(DOC_ASSEMBLY)
     asm_title = sw.m0(asm, "GetTitle")
@@ -1147,14 +1161,38 @@ def insert_component(path: str, position: list[float] | None = None) -> dict:
     if ext not in (".sldprt", ".sldasm"):
         raise ValueError("Component must be a .sldprt or .sldasm file")
     errors, warnings = sw.out_int(), sw.out_int()
-    if app.OpenDoc6(str(Path(path)), sw.DOC_TYPES[ext], 1, "", errors, warnings) is None:
+    was_open = app.GetOpenDocumentByName(str(Path(path))) is not None
+    part = app.OpenDoc6(str(Path(path)), sw.DOC_TYPES[ext], 1, "", errors, warnings)
+    if part is None:
         raise RuntimeError(f"Could not open {path}: {sw.load_error(errors.value)}")
     asm = app.ActivateDoc3(asm_title, False, 0, sw.out_int())
     x, y, z = (mm(v) for v in (position or [0, 0, 0]))
     comp = asm.AddComponent5(str(Path(path)), 0, "", False, "", x, y, z)
+    if not was_open:
+        # AddComponent5 needs the file open; its own window is not needed afterwards (the
+        # model stays loaded for the assembly). Left open, every insert kept a window and
+        # long sessions ran SOLIDWORKS out of Windows resources.
+        app.CloseDoc(sw.m0(part, "GetTitle"))
+        asm = app.ActivateDoc3(asm_title, False, 0, sw.out_int())
     if comp is None:
         raise RuntimeError(f"Could not insert {path}")
-    return {"component": comp.Name2}
+    # AddComponent5 puts the component's bounding box centre at x, y, z: move its origin there
+    data = _place_component(asm, comp, position or [0, 0, 0], rotation)
+    return {"component": comp.Name2, **_axes_info(data)}
+
+
+def _place_component(asm: Any, comp: Any, position: list[float] | None, rotation: list[float] | None) -> list[float]:
+    """Set a component's origin (mm) and/or orientation; returns the
+    transform read back (mates may hold it elsewhere)."""
+    data = list(sw.m0(comp.Transform2, "ArrayData"))
+    if rotation is not None:
+        data[0:9] = _rotation_axes(rotation)
+    if position is not None:
+        data[9:12] = [mm(v) for v in position]
+    mu = sw.m0(sw.app(), "GetMathUtility")
+    comp.Transform2 = sw.invoke(mu, "CreateTransform", sw.doubles(data))
+    sw.m0(asm, "EditRebuild3")
+    return list(sw.m0(comp.Transform2, "ArrayData"))
 
 
 @tool
@@ -1169,7 +1207,9 @@ def list_components(top_level_only: bool = True) -> list[dict]:
 
 MATES = {"coincident": 0, "concentric": 1, "perpendicular": 2, "parallel": 3, "tangent": 4, "distance": 5, "angle": 6,
          "symmetric": 8, "gear": 10, "lock": 16}
-WIDTH_MATE = 11  # swMateWIDTH: AddMate5 refuses every selection; it needs CreateMateData
+# mates whose AddMate5 form fails or does not exist: built from a mate data object
+DATA_MATES = {"width": "swMateWIDTH", "slot": "swMateSLOT", "hinge": "swMateHINGE", "screw": "swMateSCREW",
+              "rack_pinion": "swMateRACKPINION"}
 ALIGN = {"aligned": 0, "anti_aligned": 1, "closest": 2}
 
 
@@ -1184,23 +1224,42 @@ def _picked(asm: Any, entity: str, point: list[float]) -> Any:
     return obj
 
 
-def _width_mate(asm: Any, width: list[Any], tab: list[Any]) -> Any:
+def _data_mate(asm: Any, mate: str, first: Any, second: Any, more: list[Any], value: float, centered: bool) -> Any:
     import pythoncom
     from win32com.client import VARIANT
 
-    data = asm.CreateMateData(WIDTH_MATE)
+    def objects(items: list[Any]) -> Any:
+        return VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, items)
+
+    data = asm.CreateMateData(sw.constant(DATA_MATES[mate]))
     if data is None:
-        raise RuntimeError("SOLIDWORKS could not start a width mate")
-    data.WidthSelection = VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, width)
-    data.TabSelection = VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, tab)
-    data.ConstraintType = sw.constant("swMateWidth_Centered")
+        raise RuntimeError(f"SOLIDWORKS could not start a {mate} mate")
+    if mate == "width":
+        data.WidthSelection = objects([first, second])
+        data.TabSelection = objects(more)
+        data.ConstraintType = sw.constant("swMateWidth_Centered" if centered else "swMateWidth_Free")
+    elif mate == "slot":
+        data.EntitiesToMate = objects([first, second])
+        data.Constraint = sw.constant("swSlotMateConstraintOption_Centered" if centered else "swSlotMateConstraintOption_Free")
+    elif mate == "hinge":
+        sw.put_indexed(data, "EntitiesToMate", sw.constant("swHingeMateEntityType_Concentric"), objects([first, second]))
+        sw.put_indexed(data, "EntitiesToMate", sw.constant("swHingeMateEntityType_Coincident"), objects(more))
+    elif mate == "screw":
+        data.EntitiesToMate = objects([first, second])
+        data.RevolutionType = sw.constant("swDistancePerRevolution")
+        data.RevolutionVal = mm(value)
+    else:  # rack_pinion: one plain object per role (an array is refused)
+        sw.put_indexed(data, "EntitiesToMate", sw.constant("swRackPinionMateEntityType_Rack"), first)
+        sw.put_indexed(data, "EntitiesToMate", sw.constant("swRackPinionMateEntityType_Pinion"), second)
+        data.DiameterType = sw.constant("swPinionPitchDiameter")
+        data.DiameterVal = mm(value)
     return asm.CreateMate(data)
 
 
 @tool
 def add_mate(
     mate: Literal["coincident", "concentric", "perpendicular", "parallel", "tangent", "distance", "angle",
-                  "symmetric", "width", "gear", "lock"],
+                  "symmetric", "width", "gear", "lock", "slot", "hinge", "screw", "rack_pinion"],
     point1: list[float],
     point2: list[float],
     entity1: Literal["face", "edge", "vertex"] = "face",
@@ -1211,8 +1270,9 @@ def add_mate(
     min_value: float | None = None,
     max_value: float | None = None,
     plane: str = "right",
-    tab_points: list[list[float]] | None = None,
+    extra_points: list[list[float]] | None = None,
     ratio: float = 1.0,
+    centered: bool = True,
 ) -> dict:
     """Mate two entities picked by assembly-space points (mm).
     - distance / angle: `value` is the distance (mm) or angle (deg); give
@@ -1220,8 +1280,16 @@ def add_mate(
     - symmetric: the two entities mirror each other about `plane`
       ("front"/"top"/"right" or a plane name from list_features).
     - width: point1/point2 are the two width faces (a slot's walls) and
-      tab_points one point on each of the tab's two side faces; the tab is
-      centred between the walls.
+      extra_points one point on each of the tab's two side faces; the tab is
+      centred between the walls (centered=false: free between them).
+    - slot: point1 on a face of a slot, point2 on the pin (cylinder) in it;
+      the pin sits at the slot's middle (centered=false: slides along it).
+    - hinge: point1/point2 on the two cylinders that share an axis and
+      extra_points on the two faces that touch (pin through a hole, sitting
+      on the plate).
+    - screw: two cylinders on one axis; `value` = advance per turn (mm).
+    - rack_pinion: point1 on the rack's straight edge (entity1="edge"),
+      point2 on the pinion's cylinder; `value` = pinion pitch diameter (mm).
     - gear: two cylindrical faces or circular edges; entity2 turns `ratio`
       times per turn of entity1 (e.g. teeth 20/40 -> 0.5).
     - lock: fixes the two components to each other (any face of each)."""
@@ -1231,14 +1299,21 @@ def add_mate(
         raise ValueError("min_value/max_value only apply to distance and angle mates")
     if limit and (min_value is None or max_value is None or not min_value <= value <= max_value):
         raise ValueError("A limit mate needs min_value <= value <= max_value")
-    if mate == "width":
-        if not tab_points or len(tab_points) != 2:
-            # a cylinder as the tab: refused alone, and given twice the mate is made but moves nothing
-            raise ValueError("A width mate needs tab_points: one point on each of the tab's two side faces")
-        walls = [_picked(asm, entity1, point1), _picked(asm, entity2, point2)]
-        feat = _width_mate(asm, walls, [_picked(asm, "face", p) for p in tab_points])
+    if mate in DATA_MATES:
+        if mate in ("width", "hinge") and len(extra_points or []) != 2:
+            # width with a cylinder as the tab: refused alone, and given twice the mate moves nothing
+            what = "tab's two side faces" if mate == "width" else "two faces that touch"
+            raise ValueError(f"A {mate} mate needs extra_points: one point on each of the {what}")
+        if mate in ("screw", "rack_pinion") and value <= 0:
+            what = "advance per turn" if mate == "screw" else "pinion pitch diameter"
+            raise ValueError(f"A {mate} mate needs value > 0 ({what}, mm)")
+        if mate == "rack_pinion" and entity1 == "face":
+            entity1 = "edge"
+        first, second = _picked(asm, entity1, point1), _picked(asm, entity2, point2)
+        more = [_picked(asm, "face", p) for p in extra_points or []]
+        feat = _data_mate(asm, mate, first, second, more, value, centered)
         if feat is None:
-            raise RuntimeError("Width mate failed; point1/point2 must be two parallel faces and the tab inside them")
+            raise RuntimeError(f"{mate} mate failed; check what the points pick (see this tool's description)")
         sw.m0(asm, "EditRebuild3")
         return {"mate": feat.Name, "type": mate}
     asm.ClearSelection2(True)
@@ -1385,11 +1460,12 @@ def make_drawing(
     projection: Literal["third_angle", "first_angle"] = "third_angle",
     import_dimensions: bool = True,
     hole_callouts: bool = True,
+    centerlines: bool = True,
 ) -> dict:
-    """Create a drawing with the standard three views (plus model dimensions
-    and hole callouts for Hole Wizard holes) of a saved part/assembly;
-    default the active document. Export it as PDF or DXF afterwards with
-    export."""
+    """Create a drawing with the standard three views (plus model dimensions,
+    hole callouts for Hole Wizard holes and centerlines on cylinders seen
+    from the side) of a saved part/assembly; default the active document.
+    Export it as PDF or DXF afterwards with export."""
     app = sw.app()
     if not model_path:
         src = sw.active_doc()
@@ -1411,6 +1487,11 @@ def make_drawing(
             info.update(_hole_callouts(drw))
         except Exception as exc:
             info["callout_problems"] = [f"{type(exc).__name__}: {exc}"]
+    if centerlines:
+        try:
+            info["centerlines"] = sum(_centerlines(drw, _drawing_views(drw)).values())
+        except Exception as exc:
+            info["centerline_problems"] = [f"{type(exc).__name__}: {exc}"]
     drw.ForceRebuild3(False)
     return info
 
@@ -1716,6 +1797,67 @@ def center_marks(view: str = "", holes: bool = True, fillets: bool = False, slot
     drw.ClearSelection2(True)
     drw.ForceRebuild3(False)
     return {"center_marks": done}
+
+
+def _centerlines(drw: Any, views: list) -> dict:
+    """Centerlines on every cylinder seen from the side, per view: selecting
+    the whole view and inserting a centerline inserts them all."""
+    added = {}
+    for v in views:
+        before = sw.m0(v, "GetCenterLineCount") or 0
+        drw.ActivateView(v.Name)
+        drw.ClearSelection2(True)
+        if drw.Extension.SelectByID2(v.Name, "DRAWINGVIEW", 0, 0, 0, False, 0, sw.nothing(), 0):
+            sw.invoke(drw, "InsertCenterLine2")
+        added[v.Name] = (sw.m0(v, "GetCenterLineCount") or 0) - before
+    drw.ClearSelection2(True)
+    drw.ForceRebuild3(False)
+    return added
+
+
+@tool
+def centerlines(view: str = "") -> dict:
+    """Add centerlines along the cylinders (holes, shafts, bosses) that a
+    drawing view shows from the side, default every view; views that show
+    them as circles get center marks instead (center_marks)."""
+    drw = sw.active_doc(DOC_DRAWING)
+    return {"centerlines_added": _centerlines(drw, [_drawing_view(drw, view)] if view else _drawing_views(drw))}
+
+
+VIEW_DISPLAY = {"hidden_visible": "swHIDDEN_GREYED", "hidden_removed": "swHIDDEN", "wireframe": "swWIREFRAME",
+                "shaded": "swSHADED", "shaded_edges": "swSHADED_EDGES"}
+TANGENT_EDGES = {"visible": "swTangentEdgesVisible", "fonted": "swTangentEdgesVisibleAndFonted",
+                 "hidden": "swTangentEdgesHidden"}
+
+
+@tool
+def view_style(view: str = "", display: Literal["hidden_visible", "hidden_removed", "wireframe", "shaded",
+                                                "shaded_edges", ""] = "",
+               tangent_edges: Literal["visible", "fonted", "hidden", ""] = "") -> dict:
+    """Display style of a drawing view (default every view): hidden lines
+    shown dashed (hidden_visible), removed, wireframe or shaded; tangent
+    edges (where fillets meet faces) visible, in a thin font or hidden."""
+    drw = sw.active_doc(DOC_DRAWING)
+    if not display and not tangent_edges:
+        raise ValueError("Give display and/or tangent_edges")
+    names = {v: k for k, v in VIEW_DISPLAY.items()}
+    tangent_names = {v: k for k, v in TANGENT_EDGES.items()}
+    out = {}
+    for v in [_drawing_view(drw, view)] if view else _drawing_views(drw):
+        if display:
+            v.SetDisplayMode3(False, sw.constant(VIEW_DISPLAY[display]), False, True)
+        if tangent_edges:
+            v.SetDisplayTangentEdges2(sw.constant(TANGENT_EDGES[tangent_edges]))
+        out[v.Name] = (sw.m0(v, "GetDisplayMode2"), sw.m0(v, "GetDisplayTangentEdges2"))
+    drw.ForceRebuild3(False)
+    result = {}
+    for name, (mode, tangent) in out.items():
+        mode_name = names.get(sw.enum_names("swDisplayMode_e").get(mode), mode)
+        tangent_name = tangent_names.get(sw.enum_names("swDisplayTangentEdges_e").get(tangent), tangent)
+        result[name] = {"display": mode_name, "tangent_edges": tangent_name}
+        if (display and mode_name != display) or (tangent_edges and tangent_name != tangent_edges):
+            result[name]["problem"] = "SOLIDWORKS kept a different style"
+    return {"views": result}
 
 
 def _table_boxes(drw: Any) -> list[tuple[float, float, float, float]]:
@@ -2956,6 +3098,24 @@ def circular_pattern(features: list[str], count: int, axis: str = "y", angle: fl
 
 
 @tool
+def sketch_pattern(features: list[str], sketch_name: str, use_centroid: bool = True) -> dict:
+    """Copy features (e.g. a hole cut) to every point of a sketch (made with
+    sketch() "point" entities): the seed's centroid (or, use_centroid=false,
+    its sketch origin) lands on each point. For irregular hole layouts."""
+    doc = sw.active_doc(DOC_PART)
+    before = sw.m0(doc, "GetMassProperties")
+    doc.ClearSelection2(True)
+    _select_features(doc, features, 4, append=False)
+    sw.select_feature(doc, sketch_name, append=True, mark=64)
+    feat = doc.FeatureManager.FeatureSketchDrivenPattern(use_centroid, False)
+    result = _feature_result(feat, "sketch driven pattern")
+    after = sw.m0(doc, "GetMassProperties")
+    if before and after:
+        result["volume_change_mm3"] = round((after[3] - before[3]) / MM**3, 2)
+    return result
+
+
+@tool
 def mirror(features: list[str], plane: str = "right", face_point: list[float] | None = None) -> dict:
     """Mirror features (by name) about "front"/"top"/"right", a plane name,
     or the planar face at face_point (mm)."""
@@ -3012,6 +3172,58 @@ def reference_axis(axis: Literal["x", "y", "z"]) -> dict:
     """Create a reference axis along x/y/z through the origin (for patterns,
     revolves or mates)."""
     return _feature_result(_axis(sw.active_doc(DOC_PART), axis), "reference axis")
+
+
+def _rotation_axes(rotation: list[float]) -> list[float]:
+    """The X, Y and Z axes (one after another, as in MathTransform
+    ArrayData) of a rotation about the X, then Y, then Z axis, in degrees."""
+    cx, cy, cz = (math.cos(math.radians(a)) for a in rotation)
+    sx, sy, sz = (math.sin(math.radians(a)) for a in rotation)
+    r = [[cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx],
+         [sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx],
+         [-sy, cy * sx, cy * cx]]
+    return [r[row][col] for col in range(3) for row in range(3)]
+
+
+def _axes_info(data: list[float]) -> dict:
+    return {"origin_mm": [round(v / MM, 3) + 0.0 for v in data[9:12]],
+            **{f"{n}_axis": [round(v, 4) + 0.0 for v in data[3 * i:3 * i + 3]] for i, n in enumerate("xyz")}}
+
+
+@tool
+def coordinate_system(origin: list[float] | None = None, rotation: list[float] | None = None) -> dict:
+    """Reference coordinate system at origin [x,y,z] mm, turned by
+    rotation [about x, about y, about z] degrees (applied in that order),
+    e.g. for exports or measurements relative to it."""
+    doc = sw.active_doc(DOC_PART)
+    x, y, z = (mm(v) for v in (origin or [0, 0, 0]))
+    ax, ay, az = (deg(v) for v in (rotation or [0, 0, 0]))
+    doc.ClearSelection2(True)
+    feat = doc.FeatureManager.CreateCoordinateSystemUsingNumericalValues(True, x, y, z, True, ax, ay, az)
+    result = _feature_result(feat, "coordinate system")
+    xf = doc.Extension.GetCoordinateSystemTransformByName(feat.Name)
+    if xf is not None:
+        result.update(_axes_info(list(sw.m0(xf, "ArrayData"))))
+    return result
+
+
+@tool
+def reference_point(point: list[float], entity: Literal["face", "edge"] = "face") -> dict:
+    """Reference point at the centre of the face, or of the circular edge,
+    through point ([x,y,z] mm), e.g. to mate to or measure from."""
+    doc = sw.active_doc(DOC_PART)
+    doc.ClearSelection2(True)
+    sw.select_at(doc, entity, point, False)
+    kind = sw.constant("swRefPointFaceCenter" if entity == "face" else "swRefPointCenterEdge")
+    last = doc.FeatureByPositionReverse(0).Name
+    doc.FeatureManager.InsertReferencePoint(kind, 0, 0, 1)
+    newest = doc.FeatureByPositionReverse(0)  # the call returns an array of points, not the feature
+    if newest.Name == last or sw.m0(newest, "GetTypeName2") != "RefPoint":
+        raise RuntimeError(f"SOLIDWORKS made no reference point at the {entity} through {point} mm")
+    result = _feature_result(newest, "reference point")
+    p = sw.m0(sw.m0(newest, "GetSpecificFeature2"), "GetRefPoint")
+    result["point_mm"] = [round(v / MM, 3) + 0.0 for v in list(sw.m0(p, "ArrayData"))[:3]]
+    return result
 
 
 @tool
@@ -4168,6 +4380,46 @@ def loft(profiles: list[str], guides: list[str] | None = None, cut: bool = False
 
 
 @tool
+def helix(pitch: float, revolutions: float, diameter: float = 0.0, plane: str = "top",
+          center: list[float] | None = None, sketch_name: str = "", clockwise: bool = False,
+          reverse: bool = False, start_angle: float = 0.0, taper_angle: float = 0.0) -> dict:
+    """Helix curve (mm, degrees) for springs, threads and coils: around a
+    circle of `diameter` drawn on `plane` at center [x,y] (sketch
+    coordinates), or around the circle in an existing sketch_name. It rises
+    pitch per turn along the plane's normal (reverse = the other way).
+    Sweep a circle along it for a spring: sweep(path=<helix>,
+    circle_diameter=wire)."""
+    doc = sw.active_doc(DOC_PART)
+    if not sketch_name:
+        if diameter <= 0:
+            raise ValueError("Give the helix diameter, or a sketch_name with one circle")
+        cx, cy = center or [0, 0]
+        sketch_name = sketch.__wrapped__([{"type": "circle", "cx": cx, "cy": cy, "r": diameter / 2}], plane=plane,
+                                         dimension=False)["sketch"]
+    doc.ClearSelection2(True)
+    sw.select_feature(doc, sketch_name)
+    last = doc.FeatureByPositionReverse(0).Name
+    defined_by = sw.constant("swHelixDefinedByPitchAndRevolution")
+    doc.InsertHelix(reverse, clockwise, taper_angle != 0, False, defined_by, mm(pitch * revolutions),
+                    mm(pitch), revolutions, deg(taper_angle), deg(start_angle))
+    newest = doc.FeatureByPositionReverse(0)  # InsertHelix returns nothing
+    if newest.Name == last or sw.m0(newest, "GetTypeName2") != "Helix":
+        raise RuntimeError(f"SOLIDWORKS made no helix from {sketch_name}; it needs a sketch with one circle")
+    result = _feature_result(newest, "helix")
+    result.update({"height_mm": round(pitch * revolutions, 4), "length_mm": round(
+        revolutions * math.hypot(math.pi * (diameter or _circle_diameter(doc, sketch_name)), pitch), 3)})
+    return result
+
+
+def _circle_diameter(doc: Any, sketch_name: str) -> float:
+    sk = sw.m0(sw.feature(doc, sketch_name), "GetSpecificFeature2")
+    for seg in sw.m0(sk, "GetSketchSegments") or ():
+        if sw.m0(seg, "GetType") == sw.constant("swSketchARC"):
+            return 2 * sw.m0(seg, "GetRadius") / MM
+    return 0.0
+
+
+@tool
 def rib(thickness: float, sketch_name: str = "", both_sides: bool = True, flip_material: bool = False) -> dict:
     """Rib from an open sketch (e.g. one line between two walls), default
     the most recent sketch; thickness in mm."""
@@ -4835,11 +5087,14 @@ def set_component(
     visible: bool | None = None,
     suppressed: bool | None = None,
     position: list[float] | None = None,
+    rotation: list[float] | None = None,
 ) -> dict:
     """Change a component of the active assembly (name as in
     list_components, e.g. "bracket-1"): fix or float it, hide or show it,
-    suppress or resolve it, or move its origin to position [x,y,z] mm (only
-    moves freely if mates do not hold it)."""
+    suppress or resolve it, move its origin to position [x,y,z] mm, or turn
+    it to rotation [about x, about y, about z] degrees from the assembly
+    axes (applied in that order). Moving only works where mates do not
+    hold it."""
     asm = sw.active_doc(DOC_ASSEMBLY)
     comp = _component(asm, name)
     if suppressed is not None:
@@ -4851,23 +5106,19 @@ def set_component(
         sw.m0(asm, "FixComponent" if fixed else "UnfixComponent")
     if visible is not None:
         comp.Visible = 1 if visible else 0
-    if position is not None:
-        xf = comp.Transform2
-        data = list(sw.m0(xf, "ArrayData"))
-        data[9:12] = [mm(v) for v in position]
-        mu = sw.m0(sw.app(), "GetMathUtility")
-        comp.Transform2 = sw.invoke(mu, "CreateTransform", sw.doubles(data))
-        sw.m0(asm, "EditRebuild3")
+    if position is not None or rotation is not None:
+        _place_component(asm, comp, position, rotation)
     asm.ClearSelection2(True)
     sw.m0(asm, "GraphicsRedraw2")
-    origin = list(sw.m0(comp.Transform2, "ArrayData"))[9:12] if not sw.m0(comp, "IsSuppressed") else None
-    return {
+    result = {
         "component": comp.Name2,
         "fixed": bool(sw.m0(comp, "IsFixed")),
         "visible": bool(comp.Visible),
         "suppressed": bool(sw.m0(comp, "IsSuppressed")),
-        "origin_mm": [round(v / MM, 3) for v in origin] if origin else None,
     }
+    if not result["suppressed"]:
+        result.update(_axes_info(list(sw.m0(comp.Transform2, "ArrayData"))))
+    return result
 
 
 def _pick(doc: Any, obj: Any, mark: int, append: bool) -> bool:

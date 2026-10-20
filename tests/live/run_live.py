@@ -160,6 +160,24 @@ def parts() -> None:
     S.combine_bodies("subtract", [-20, 5, 20], [[38, 20, 0]])
     check("combine subtract", len(S.list_bodies()) == 1)
 
+    new()
+    h = S.helix(pitch=10, revolutions=5, diameter=20)
+    S.sweep(h["feature"], circle_diameter=2)
+    near("spring (helix sweep) volume", volume(), math.pi * 1 * h["length_mm"], 0.5)
+    cs = S.coordinate_system([10, 20, 30], [90, 0, 0])
+    check("coordinate system origin and turned y axis", cs["origin_mm"] == [10.0, 20.0, 30.0] and cs["y_axis"] == [0.0, 0.0, 1.0], str(cs))
+
+    new()
+    S.sketch([{"type": "center_rectangle", "cx": 0, "cy": 0, "width": 60, "height": 40}], plane="top")
+    S.extrude(depth=5)
+    S.sketch([{"type": "circle", "cx": -20, "cy": 0, "r": 3}], face_point=[0, 5, 0])
+    cut = S.extrude(depth=5, cut=True, end="through_all")["feature"]
+    pts = S.sketch([{"type": "point", "x": 0, "y": 0}, {"type": "point", "x": 20, "y": 10}],
+                   face_point=[0, 5, 0], dimension=False)["sketch"]
+    near("sketch pattern: two more holes", S.sketch_pattern([cut], pts)["volume_change_mm3"], -2 * math.pi * 9 * 5, 0.05)
+    rp = S.reference_point([-17, 5, 0], entity="edge")
+    check("reference point at the hole centre", rp["point_mm"] == [-20.0, 5.0, 0.0], str(rp))
+
 
 def holes() -> None:
     new()
@@ -232,7 +250,7 @@ def assembly() -> None:
     ax, ay, az = org(a)
     cx, cy, cz = org(c)
     S.add_mate("width", [ax - 10, ay + 10, az], [ax + 10, ay + 10, az],
-               tab_points=[[cx - 10, cy + 10, cz], [cx + 10, cy + 10, cz]])
+               extra_points=[[cx - 10, cy + 10, cz], [cx + 10, cy + 10, cz]])
     near("width mate centres the tab", org(c)[0], ax, 0.01)
     bx, by, bz = org(b)
     limit = S.add_mate("distance", [bx, by, bz], [ax, ay + 20, az], value=5, min_value=0, max_value=30)
@@ -243,6 +261,45 @@ def assembly() -> None:
     S.rename_feature(limit["mate"], "lift range")
     mates = {m["name"]: m for m in S.list_mates()}
     check("limit mate renamed and listed", mates.get("lift range", {}).get("limits") == [0.0, 30.0], str(mates.get("lift range")))
+
+    # mechanical mates: a plate (slot x -30..-10 and a 10 mm hole at x 20), 8 mm pins and a rack bar
+    new()
+    S.sketch([{"type": "center_rectangle", "cx": 0, "cy": 0, "width": 80, "height": 40}], plane="top")
+    S.extrude(depth=10)
+    S.sketch([{"type": "slot", "x1": -30, "y1": 0, "x2": -10, "y2": 0, "width": 8},
+              {"type": "circle", "cx": 20, "cy": 0, "r": 5}], face_point=[0, 10, 0], dimension=False)
+    S.extrude(depth=10, cut=True, end="through_all")
+    S.save(path("plate.SLDPRT"))
+    new()
+    S.sketch([{"type": "circle", "cx": 0, "cy": 0, "r": 4}], plane="top", dimension=False)
+    S.extrude(depth=30)
+    S.save(path("pin.SLDPRT"))
+    new()
+    S.sketch([{"type": "rectangle", "x1": -50, "y1": -5, "x2": 50, "y2": 5}], plane="top", dimension=False)
+    S.extrude(depth=10)
+    S.save(path("rack.SLDPRT"))
+    new("assembly")
+    plate = S.insert_component(path("plate.SLDPRT"))["component"]
+    pin1 = S.insert_component(path("pin.SLDPRT"), [0, 30, 0])
+    check("insert puts the origin at the position", pin1["origin_mm"] == [0.0, 30.0, 0.0], str(pin1))
+    pin2 = S.insert_component(path("pin.SLDPRT"), [50, 30, 30], [0, 0, 90])["component"]
+    turned = S.set_component(pin2)["y_axis"]
+    check("insert turns the component (z 90: y axis -> -x)", turned == [-1.0, 0.0, 0.0], str(turned))
+    S.set_component(pin2, rotation=[0, 0, 0])
+    S.insert_component(path("rack.SLDPRT"), [0, 0, 60])
+    S.add_mate("slot", [-20, 5, 4], [4, 45, 0])
+    near("slot mate centres the pin (x)", org(pin1["component"])[0], -20, 0.01)
+    S.add_mate("hinge", [54, 45, 30], [25, 5, 0], extra_points=[[50, 30, 30], [0, 10, 10]])
+    near("hinge: pin in the hole (x)", org(pin2)[0], 20, 0.01)
+    near("hinge: pin on the plate (y)", org(pin2)[1], 10, 0.01)
+    S.add_mate("rack_pinion", [0, 10, 65], [-16, 45, 0], value=20)
+    check("rack and pinion mate", any(m.get("type") == "rack_pinion" for m in S.list_mates()))
+    new("assembly")
+    S.insert_component(path("plate.SLDPRT"))
+    pin = S.insert_component(path("pin.SLDPRT"), [50, 30, 30])["component"]
+    S.add_mate("screw", [54, 45, 30], [25, 5, 0], value=2)
+    o = org(pin)
+    check("screw mate puts the pin on the hole axis", abs(o[0] - 20) < 0.01 and abs(o[2]) < 0.01, str(o))
 
 
 def drawing() -> None:
@@ -256,6 +313,11 @@ def drawing() -> None:
     S.set_tolerance(r["dimension"], "symmetric", upper=0.1)
     holes_dims = S.dimension_holes(view="도면뷰2")
     check("dimension_holes", holes_dims["horizontal_dimensions"] >= 3, str(holes_dims))
+    styles = S.view_style(display="hidden_visible", tangent_edges="hidden")["views"]
+    check("view style read back", all(v["display"] == "hidden_visible" and v["tangent_edges"] == "hidden"
+                                      for v in styles.values()), str(styles))
+    lines = S.centerlines()["centerlines_added"]
+    check("centerlines on side views", sum(lines.values()) + d.get("centerlines", 0) >= 1, f"{lines}, make_drawing {d.get('centerlines')}")
     flat = S.flat_pattern_view()
     near("flat pattern view width", flat["dimensions"].get("horizontal"), 46 + 38 + math.pi / 2 * 3, 0.02)
     out = S.export(path("sm.pdf"))
