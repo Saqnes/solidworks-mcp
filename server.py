@@ -66,7 +66,7 @@ def tool(fn=None, *, timeout: float | None = None):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             try:
-                return call(lambda: _with_rebuild_errors(fn(*args, **kwargs)), timeout)
+                return call(lambda: _busy(lambda: _with_rebuild_errors(fn(*args, **kwargs))), timeout)
             except ToolError:
                 raise
             except Exception as exc:
@@ -79,6 +79,25 @@ def tool(fn=None, *, timeout: float | None = None):
 
 
 TOOLS: dict[str, Any] = {}  # tool name -> plain function (runs on the COM thread), for run_steps
+
+
+def _busy(work: Any) -> Any:
+    """Run work with ISldWorks.CommandInProgress set, which tells SOLIDWORKS
+    an outside program is making many calls: the same modelling sequence
+    ran in 6.7 s instead of 9.3 s."""
+    try:
+        app = sw.app()
+        app.CommandInProgress = True
+    except Exception:
+        app = None
+    try:
+        return work()
+    finally:
+        if app is not None:
+            try:
+                app.CommandInProgress = False
+            except Exception:
+                pass
 
 
 def _feature_errors(doc: Any) -> list[dict]:
@@ -617,9 +636,15 @@ def list_edges(feature: str = "", type: Literal["", "line", "circle", "other"] =
     return {"edges": edges, "total": total, **({"truncated": True} if total > len(edges) else {})}
 
 
+SHOT_SIZES = {"small": (640, 480), "medium": (960, 720), "large": (1280, 960)}
+
+
 @tool
-def screenshot(view: Literal["current", "front", "back", "left", "right", "top", "bottom", "isometric", "trimetric", "dimetric"] = "isometric", zoom_to_fit: bool = True) -> list:
-    """Image of the active document's graphics area, optionally reoriented."""
+def screenshot(view: Literal["current", "front", "back", "left", "right", "top", "bottom", "isometric", "trimetric", "dimetric"] = "isometric",
+               zoom_to_fit: bool = True, size: Literal["small", "medium", "large"] = "medium") -> list:
+    """Image of the active document's graphics area, optionally reoriented.
+    size: small 640x480 (quick checks, fewest tokens), medium 960x720,
+    large 1280x960 (fine details)."""
     from PIL import Image as PILImage
 
     doc = sw.active_doc()
@@ -630,10 +655,11 @@ def screenshot(view: Literal["current", "front", "back", "left", "right", "top",
     sw.m0(doc, "GraphicsRedraw2")
     with tempfile.TemporaryDirectory() as tmp:
         bmp = os.path.join(tmp, "view.bmp")
-        if not doc.SaveBMP(bmp, 1280, 960) or not os.path.exists(bmp):
+        width, height = SHOT_SIZES[size]
+        if not doc.SaveBMP(bmp, width, height) or not os.path.exists(bmp):
             raise RuntimeError("SOLIDWORKS could not save the view image")
         img = PILImage.open(bmp).convert("RGB")
-        img.thumbnail((1280, 1280))
+        img.thumbnail((width, width))
         buf = io.BytesIO()
         img.save(buf, "JPEG", quality=85)
     return [f"{sw.m0(doc, 'GetTitle')} ({view})", Image(data=buf.getvalue(), format="jpeg")]
@@ -1433,7 +1459,8 @@ def list_components(top_level_only: bool = True) -> list[dict]:
     """Components of the active assembly."""
     asm = sw.active_doc(DOC_ASSEMBLY)
     return [
-        {"name": c.Name2, "path": sw.m0(c, "GetPathName"), "suppressed": bool(sw.m0(c, "IsSuppressed")), "fixed": bool(sw.m0(c, "IsFixed"))}
+        {"name": c.Name2, "path": sw.m0(c, "GetPathName"), "configuration": c.ReferencedConfiguration,
+         "suppressed": bool(sw.m0(c, "IsSuppressed")), "fixed": bool(sw.m0(c, "IsFixed"))}
         for c in (asm.GetComponents(top_level_only) or ())
     ]
 
@@ -4814,6 +4841,36 @@ def flatten(flat: bool = True) -> str:
 
 
 @tool
+def insert_bends(fixed_face_point: list[float], bend_radius: float, k_factor: float = 0.5,
+                 auto_relief: bool = True, relief_ratio: float = 0.5) -> dict:
+    """Turn a thin solid of even thickness (e.g. an imported STEP bracket with
+    sharp corners) into sheet metal: every sharp bend gets bend_radius (mm,
+    inside) and the part can then be flattened and exported as a flat
+    pattern. The face at fixed_face_point stays put when it flattens."""
+    doc = sw.active_doc(DOC_PART)
+    doc.ClearSelection2(True)
+    sw.select_at(doc, "FACE", fixed_face_point, False)
+    # Radius, bend table (none), K-factor, bend allowance (-1 = not used), auto relief, relief ratio
+    if not doc.InsertBends(mm(bend_radius), "", k_factor, -1, auto_relief, relief_ratio):
+        raise RuntimeError("SOLIDWORKS could not insert bends; the part must be one even thickness, "
+                           "and fixed_face_point must be on one of its flat faces")
+    kinds = [sw.m0(f, "GetTypeName2") for f in sw.iter_features(doc)]
+    result = {"sheet_metal": "SheetMetal" in kinds, "bend_radius_mm": bend_radius, "k_factor": k_factor}
+    try:  # the flat size, read from the flattened body
+        TOOLS["flatten"](True)
+        box = _body_box(doc)
+        result["flat_size_mm"] = sorted((round(abs(box[i + 3] - box[i]) / MM, 3) for i in range(3)), reverse=True)
+    except Exception:
+        pass
+    finally:
+        try:
+            TOOLS["flatten"](False)
+        except Exception:
+            pass
+    return result
+
+
+@tool
 def export_flat_pattern(path: str, bend_lines: bool = True) -> dict:
     """Export the flat pattern of the active (saved) sheet metal part to
     DXF/DWG for laser cutting, with bend lines by default."""
@@ -5357,13 +5414,15 @@ def set_component(
     suppressed: bool | None = None,
     position: list[float] | None = None,
     rotation: list[float] | None = None,
+    configuration: str = "",
 ) -> dict:
     """Change a component of the active assembly (name as in
     list_components, e.g. "bracket-1"): fix or float it, hide or show it,
     suppress or resolve it, move its origin to position [x,y,z] mm, or turn
     it to rotation [about x, about y, about z] degrees from the assembly
     axes (applied in that order). Moving only works where mates do not
-    hold it."""
+    hold it. configuration switches which configuration of its part the
+    component shows (names from configurations() in that part)."""
     asm = sw.active_doc(DOC_ASSEMBLY)
     comp = _component(asm, name)
     if suppressed is not None:
@@ -5375,6 +5434,12 @@ def set_component(
         sw.m0(asm, "FixComponent" if fixed else "UnfixComponent")
     if visible is not None:
         comp.Visible = 1 if visible else 0
+    if configuration:
+        comp.ReferencedConfiguration = configuration
+        sw.m0(asm, "EditRebuild3")
+        comp = _component(asm, comp.Name2)
+        if comp.ReferencedConfiguration != configuration:
+            raise LookupError(f"{comp.Name2} has no configuration {configuration!r} (it shows {comp.ReferencedConfiguration!r})")
     if position is not None or rotation is not None:
         _place_component(asm, comp, position, rotation)
     asm.ClearSelection2(True)
@@ -5384,6 +5449,7 @@ def set_component(
         "fixed": bool(sw.m0(comp, "IsFixed")),
         "visible": bool(comp.Visible),
         "suppressed": bool(sw.m0(comp, "IsSuppressed")),
+        "configuration": comp.ReferencedConfiguration,
     }
     if not result["suppressed"]:
         result.update(_axes_info(list(sw.m0(comp.Transform2, "ArrayData"))))
@@ -5658,6 +5724,33 @@ def run_macro(path: str, module: str, procedure: str) -> str:
     if not sw.app().RunMacro2(str(Path(path)), module, procedure, 1, err):
         raise RuntimeError(f"Macro failed (swRunMacroError {err.value})")
     return "macro finished"
+
+
+def _compact(node: Any) -> Any:
+    """A JSON schema without the parts a model does not need: pydantic's
+    per-field "title" and the "anyOf [X, null]" of optional arguments
+    (their default stays null). Arguments are still validated against the
+    full signature."""
+    if isinstance(node, list):
+        return [_compact(v) for v in node]
+    if not isinstance(node, dict):
+        return node
+    node = {k: _compact(v) for k, v in node.items() if k != "title"}
+    options = node.get("anyOf")
+    if isinstance(options, list) and len(options) == 2 and {"type": "null"} in options:
+        node.pop("anyOf")
+        node = {**next(o for o in options if o != {"type": "null"}), **node}
+    return node
+
+
+def _compact_tool_schemas() -> None:
+    # The tool list goes to the model with every message: 126 tools took
+    # ~46,000 characters of argument schemas, ~28,000 after this.
+    for t in mcp._tool_manager._tools.values():
+        t.parameters = _compact(t.parameters)
+
+
+_compact_tool_schemas()
 
 
 def main() -> None:

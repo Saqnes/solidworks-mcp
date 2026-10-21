@@ -22,6 +22,12 @@ user in Korean.
   hand-computed value; it only opens/closes its own `live_*` documents in a
   temp folder. Run it before pushing changes to existing tools and add a
   check for each new tool.
+- Claude Desktop extension: `scripts\build_mcpb.py` writes the version and
+  tool list into `manifest.json` (manifest 0.4, server.type "uv": Claude
+  Desktop installs Python and the packages from pyproject.toml itself) and
+  packs `dist\solidworks-mcp-<version>.mcpb` with `npx @anthropic-ai/mcpb`
+  (.mcpbignore keeps it to the server files). Checked by unpacking it and
+  starting it with `uv run --directory <dir> server.py` over stdio.
 - Commit style: imperative subject, body explains the observed failure and
   the fix. Push to `main`.
 - Install: `install.cmd` → `install.ps1` (venv, pip, registration, check);
@@ -175,6 +181,18 @@ user in Korean.
     Transform2 (`_Placement`). IPartDoc.MirrorPart2(BreakLink, Options,
     ByRef ResultPart) with a plane selected makes the opposite-hand part
     as a new active document (feature "MirrorStock").
+27. Speed: tool time is mostly the model's round trips, not SOLIDWORKS
+    (sketch ~0.5 s, extrude ~0.3 s, make_drawing ~1 s, PDF ~1.1 s).
+    ISldWorks.CommandInProgress = True around every tool (`_busy`) cut a
+    modelling sequence from 9.3 s to 6.7 s. Tool schemas go to the model
+    with every message, so `_compact_tool_schemas` drops pydantic titles
+    and "anyOf [X, null]" (46k -> 28k characters; arguments are still
+    validated against the signature). Sheet metal from a thin solid:
+    IPartDoc.InsertBends(radius, "", k, -1, relief, ratio) with the fixed
+    face selected works (flat length checked);
+    InsertConvertToSheetMetal2 with the same selection kept only the base
+    flange. Component configuration = IComponent2.ReferencedConfiguration
+    (read back to check).
 
 ## Verified on the real SOLIDWORKS
 
@@ -196,7 +214,8 @@ functions, each result checked (volumes, positions, PDFs rendered):
   helix (+ spring sweep), coordinate_system, sketch_pattern,
   reference_point, list_faces, list_edges (parts and assembly
   components), run_steps with result references, rebuild_errors,
-  document_units, mirror_part.
+  document_units, mirror_part, insert_bends, component configurations,
+  the .mcpb bundle (unpacked and run through uv).
 - Sheet metal: base flange, edge_flange (90° and 60°), miter_flange along
   two edges, hem.
 - Weldments: structural_member (iso square tube, mitre corners),

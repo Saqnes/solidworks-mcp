@@ -245,6 +245,16 @@ def sheetmetal() -> None:
             xs.append(float(val))
     near("flat pattern length (50-4 + 42-4 + pi/2*3)", max(xs) - min(xs), 46 + 38 + math.pi / 2 * 3, 0.02)
 
+    # a sharp-cornered L of 2 mm plate (like an imported STEP) made into sheet metal
+    new()
+    pts = [(0, 0), (40, 0), (40, 2), (2, 2), (2, 30), (0, 30), (0, 0)]
+    S.sketch([{"type": "line", "x1": a[0], "y1": a[1], "x2": b[0], "y2": b[1]} for a, b in zip(pts, pts[1:])],
+             plane="front", dimension=False)
+    S.extrude(depth=30)
+    bent = S.insert_bends([20, 2, 15], 2)
+    check("insert_bends makes sheet metal", bent["sheet_metal"], str(bent))
+    near("insert_bends flat length (36 + 26 + pi/2*3)", bent.get("flat_size_mm", [0])[0], 36 + 26 + math.pi / 2 * 3, 0.01)
+
 
 def weldment() -> None:
     new()
@@ -330,6 +340,20 @@ def assembly() -> None:
     near("hinge: pin on the plate (y)", org(pin2)[1], 10, 0.01)
     S.add_mate("rack_pinion", [0, 10, 65], [-16, 45, 0], value=20)
     check("rack and pinion mate", any(m.get("type") == "rack_pinion" for m in S.list_mates()))
+    # a part with a second, shorter configuration, switched in the assembly
+    new()
+    S.sketch([{"type": "circle", "cx": 0, "cy": 0, "r": 5}], plane="top", dimension=False)
+    S.extrude(depth=40)
+    S.configurations(add="short")
+    S.set_dimension("D1@보스-돌출1", 10)
+    S.configurations(activate="기본")
+    S.save(path("rod.SLDPRT"))
+    new("assembly")
+    rod = S.insert_component(path("rod.SLDPRT"))["component"]
+    switched = S.set_component(rod, configuration="short")
+    check("set_component switches the configuration", switched["configuration"] == "short", str(switched))
+    near("the short configuration is 10 mm long", max(f["point_mm"][1] for f in S.list_faces(type="plane")["faces"]), 10, 0.01)
+
     new("assembly")
     S.insert_component(path("plate.SLDPRT"))
     pin = S.insert_component(path("pin.SLDPRT"), [50, 30, 30])["component"]

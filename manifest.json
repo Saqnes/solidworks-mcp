@@ -1,0 +1,578 @@
+{
+  "manifest_version": "0.4",
+  "name": "solidworks-mcp",
+  "display_name": "SOLIDWORKS",
+  "version": "0.2.0",
+  "description": "SOLIDWORKS(2025)를 Claude에서 조작합니다: 파트 모델링, 판금, 용접 구조물, 어셈블리 메이트, 도면과 PDF/DXF 내보내기.",
+  "long_description": "실행 중인 SOLIDWORKS를 COM API로 조작하는 MCP 서버입니다. 스케치·돌출·구멍 가공 마법사·필렛, 판금과 용접 구조물, 어셈블리 메이트(슬롯·힌지·기어 등), 도면(치수·공차·표제란·BOM)과 PDF/DXF/STEP 내보내기를 도구 130여 개로 제공합니다. 한글 UI와 Windows 전용입니다. 처음 켤 때 Python 패키지를 내려받느라 1~2분 걸릴 수 있습니다.",
+  "author": {
+    "name": "Saqnes"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Saqnes/solidworks-mcp"
+  },
+  "icon": "icon.png",
+  "server": {
+    "type": "uv",
+    "entry_point": "server.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "${__dirname}",
+        "server.py"
+      ],
+      "env": {
+        "SW_TIMEOUT": "${user_config.timeout}",
+        "SW_PROGID": "${user_config.progid}"
+      }
+    }
+  },
+  "tools_generated": true,
+  "user_config": {
+    "timeout": {
+      "type": "number",
+      "title": "응답 대기 시간(초)",
+      "description": "SOLIDWORKS가 이 시간 안에 답하지 않으면 도구가 멈추지 않고 오류를 돌려줍니다(대개 SOLIDWORKS에 대화 상자가 떠 있을 때).",
+      "default": 90,
+      "min": 10,
+      "max": 600,
+      "required": false
+    },
+    "progid": {
+      "type": "string",
+      "title": "SOLIDWORKS 버전(ProgID)",
+      "description": "여러 버전이 깔려 있을 때만 바꾸세요. 예: SldWorks.Application.33 (2025)",
+      "default": "SldWorks.Application",
+      "required": false
+    }
+  },
+  "compatibility": {
+    "platforms": [
+      "win32"
+    ],
+    "runtimes": {
+      "python": ">=3.11"
+    }
+  },
+  "keywords": [
+    "solidworks",
+    "cad",
+    "3d",
+    "drawing",
+    "솔리드웍스",
+    "도면"
+  ],
+  "tools": [
+    {
+      "name": "activate_document",
+      "description": "Bring an open document (by title, as in list_documents) to the front."
+    },
+    {
+      "name": "add_dimension",
+      "description": "Add a dimension to a drawing view (default the first) on model geometry picked by model points ([x,y,z] mm):"
+    },
+    {
+      "name": "add_hole_callouts",
+      "description": "Add hole callouts (e.g."
+    },
+    {
+      "name": "add_mate",
+      "description": "Mate two entities picked by assembly-space points (mm)."
+    },
+    {
+      "name": "angle_plane",
+      "description": "Reference plane through an axis at `angle` degrees to a plane."
+    },
+    {
+      "name": "auto_balloons",
+      "description": "Number the components of an assembly drawing with balloons (matching the BOM table), in one view (default every view)."
+    },
+    {
+      "name": "auxiliary_view",
+      "description": "Auxiliary view looking square onto an inclined face:"
+    },
+    {
+      "name": "bom",
+      "description": "Bill of materials of the active assembly:"
+    },
+    {
+      "name": "bom_table",
+      "description": "Insert a bill of materials table for the assembly in a drawing view (default the first) with its top left corner at position [x,y] mm (default a free spot near the sheet's top right)."
+    },
+    {
+      "name": "break_view",
+      "description": "Shorten a long part in a drawing view (default the first):"
+    },
+    {
+      "name": "broken_out_section",
+      "description": "Broken-out (partial) section:"
+    },
+    {
+      "name": "center_marks",
+      "description": "Add center marks to the holes (and optionally fillets and slots) of a drawing view, default every view."
+    },
+    {
+      "name": "centerlines",
+      "description": "Add centerlines along the cylinders (holes, shafts, bosses) that a drawing view shows from the side, default every view; views that show them as circles get center marks instead (center_marks)."
+    },
+    {
+      "name": "chamfer",
+      "description": "Angle-distance chamfer on the edges through the given points (mm)."
+    },
+    {
+      "name": "check_interference",
+      "description": "Interferences between components of the active assembly (touching faces are not counted), with the overlap volume."
+    },
+    {
+      "name": "circular_pattern",
+      "description": "Repeat features around an axis:"
+    },
+    {
+      "name": "close_document",
+      "description": "Close a document (default:"
+    },
+    {
+      "name": "combine_bodies",
+      "description": "Combine solid bodies of a multibody part."
+    },
+    {
+      "name": "component_pattern",
+      "description": "Pattern assembly components (names as in list_components)."
+    },
+    {
+      "name": "configurations",
+      "description": "List configurations; optionally add one (it becomes active) or activate an existing one."
+    },
+    {
+      "name": "coordinate_system",
+      "description": "Reference coordinate system at origin [x,y,z] mm, turned by rotation [about x, about y, about z] degrees (applied in that order), e.g."
+    },
+    {
+      "name": "cosmetic_thread",
+      "description": "Cosmetic thread on a cylinder (a shaft's outside or a plain hole), starting at the circular edge through edge_point ([x,y,z] mm)."
+    },
+    {
+      "name": "custom_properties",
+      "description": "Read the document's custom properties, after first adding/replacing any given in set_values (e.g."
+    },
+    {
+      "name": "cut_list",
+      "description": "The weldment cut list of the active part:"
+    },
+    {
+      "name": "cut_list_table",
+      "description": "Weldment cut list table (item, quantity, description, length) for the weldment part in a drawing view (default the first), at position (top left, mm) or a free spot near the sheet's top right."
+    },
+    {
+      "name": "datum",
+      "description": "Datum feature symbol (e.g."
+    },
+    {
+      "name": "delete_equation",
+      "description": "Remove the equation or global variable whose left side is `lhs`."
+    },
+    {
+      "name": "delete_feature",
+      "description": "Delete a feature."
+    },
+    {
+      "name": "detail_view",
+      "description": "Enlarged detail of the circle of `radius` (model mm) around a model point ([x,y,z] mm) in a drawing view (default the first)."
+    },
+    {
+      "name": "dimension_holes",
+      "description": "Position every hole seen in a drawing view (default the first view that shows holes face on) with ordinate dimensions from the view's lower left corner:"
+    },
+    {
+      "name": "document_units",
+      "description": "Read, and optionally change, the active document's length unit and the decimal places shown for lengths and angles (values in the model and the dimensions of a drawing), e.g."
+    },
+    {
+      "name": "dome",
+      "description": "Dome of `height` mm on the planar face at face_point (reverse makes a dent instead)."
+    },
+    {
+      "name": "draft",
+      "description": "Neutral-plane draft:"
+    },
+    {
+      "name": "drawing_note",
+      "description": "Put a note (several lines with \\n) on the active drawing sheet at [x,y] mm from the sheet's lower left corner; height = text height in mm (0 = document default)."
+    },
+    {
+      "name": "drawing_sheets",
+      "description": "List the drawing's sheets; add one (named `add`, same paper as the current sheet, optionally another sheet_format such as \"a3 - iso\" and scale \"1:2\") or activate one."
+    },
+    {
+      "name": "drawing_view",
+      "description": "Add a model view (e.g."
+    },
+    {
+      "name": "edge_flange",
+      "description": "Sheet metal edge flange along the straight edge through edge_point ([x,y,z] mm), `length` mm long measured from the face the edge lies on, bent `angle` degrees (90 = perpendicular) towards that face's"
+    },
+    {
+      "name": "edit_sketch",
+      "description": "Add entities to an existing sketch (name from list_features), in its own 2D coordinates (mm), with the same entity types as sketch()."
+    },
+    {
+      "name": "end_cap",
+      "description": "Close the open ends of weldment tubes with end caps `thickness` mm thick."
+    },
+    {
+      "name": "engrave",
+      "description": "Engrave (cut) or emboss (raise) text on the planar face at face_point (mm)."
+    },
+    {
+      "name": "exploded_view",
+      "description": "Exploded view of the active assembly."
+    },
+    {
+      "name": "export",
+      "description": "Export a copy of the active document; the format follows the extension (.step/.stp, .igs, .x_t, .stl, .3mf, .pdf, .dxf/.dwg (drawings), .png/.jpg, .eDrawings)."
+    },
+    {
+      "name": "export_flat_pattern",
+      "description": "Export the flat pattern of the active (saved) sheet metal part to DXF/DWG for laser cutting, with bend lines by default."
+    },
+    {
+      "name": "export_folder",
+      "description": "Export every .sldprt/.sldasm in a folder to another format (step, igs, x_t, stl, 3mf, pdf ...), next to the originals."
+    },
+    {
+      "name": "extrude",
+      "description": "Boss-extrude (or cut-extrude with cut=true) a sketch, default the most recent one."
+    },
+    {
+      "name": "face_color",
+      "description": "Colour single faces of the active part (picked by points on them, [[x,y,z], ...] mm), e.g."
+    },
+    {
+      "name": "face_fillet",
+      "description": "Face fillet of `radius` mm blending two faces (points on each, [x,y,z] mm); unlike an edge fillet the faces need not share an edge."
+    },
+    {
+      "name": "fillet",
+      "description": "Constant-radius fillet on the edges passing through the given model points ([[x,y,z], ...] in mm; a point on the edge, e.g."
+    },
+    {
+      "name": "flat_pattern_view",
+      "description": "Add the flat pattern of a sheet metal part (the one the drawing shows, or model_path) as a drawing view, with bend lines unless hide_bend_lines."
+    },
+    {
+      "name": "flatten",
+      "description": "Show a sheet metal part flat (true) or folded (false), in the active configuration."
+    },
+    {
+      "name": "geometric_tolerance",
+      "description": "Geometric tolerance frame (e.g."
+    },
+    {
+      "name": "gusset",
+      "description": "Gusset plate in the corner between two planar faces of a weldment (points on each, [x,y,z] mm), size1 x size2 mm along them, `thickness` mm thick."
+    },
+    {
+      "name": "helix",
+      "description": "Helix curve (mm, degrees) for springs, threads and coils:"
+    },
+    {
+      "name": "hem",
+      "description": "Sheet metal hem (folded-back edge) on the edges through edge_points ([[x,y,z], ...] mm)."
+    },
+    {
+      "name": "hole",
+      "description": "ISO metric holes (M2-M20) at several positions at once, on the face at face_point ([x,y,z] mm, e.g."
+    },
+    {
+      "name": "hole_table",
+      "description": "Hole table (tag, X/Y position, size of every hole) for the holes of a face in a drawing view (default the first view that shows holes face on)."
+    },
+    {
+      "name": "import_file",
+      "description": "Open a neutral CAD file (.step/.stp, .igs/.iges, .x_t/.x_b, .sat, .stl) as a new SOLIDWORKS part or assembly."
+    },
+    {
+      "name": "insert_bends",
+      "description": "Turn a thin solid of even thickness (e.g."
+    },
+    {
+      "name": "insert_component",
+      "description": "Insert a part/assembly file into the active assembly with its origin at position [x,y,z] mm (default the assembly origin), turned by rotation [about x, about y, about z] degrees (applied in that order"
+    },
+    {
+      "name": "linear_pattern",
+      "description": "Repeat features (by name, e.g."
+    },
+    {
+      "name": "list_bodies",
+      "description": "Solid bodies of the active part (several after extrude(merge=false), split or mirror), with volume and bounding box, for combine_bodies."
+    },
+    {
+      "name": "list_components",
+      "description": "Components of the active assembly."
+    },
+    {
+      "name": "list_dimensions",
+      "description": "Dimensions of all features (or one feature), with names usable in set_dimension, e.g."
+    },
+    {
+      "name": "list_documents",
+      "description": "All documents currently open in SOLIDWORKS."
+    },
+    {
+      "name": "list_edges",
+      "description": "Edges of the active part (or of the components of an assembly, in assembly coordinates) with point_mm, the edge's midpoint to pass to fillet/chamfer and other edge picks, its length, and for circles t"
+    },
+    {
+      "name": "list_equations",
+      "description": "Global variables and equations of the active document."
+    },
+    {
+      "name": "list_faces",
+      "description": "Faces of the active part (or, in an assembly, of every component or one `component`, in assembly coordinates), each with point_mm:"
+    },
+    {
+      "name": "list_features",
+      "description": "Feature tree of the active document, in order."
+    },
+    {
+      "name": "list_materials",
+      "description": "Search the material library by name or category (e.g."
+    },
+    {
+      "name": "list_mates",
+      "description": "Mates of the active assembly with their type, the components they connect and their value (distance mm / angle deg) where they have one."
+    },
+    {
+      "name": "list_views",
+      "description": "Views on the active drawing sheet with their scale, centre and size on the sheet (mm), for placing new views and annotations."
+    },
+    {
+      "name": "loft",
+      "description": "Loft through profile sketches (names, in order, on different planes, e.g."
+    },
+    {
+      "name": "make_drawing",
+      "description": "Create a drawing with the standard three views (plus model dimensions, hole callouts for Hole Wizard holes and centerlines on cylinders seen from the side) of a saved part/assembly; default the active"
+    },
+    {
+      "name": "measure",
+      "description": "Measure one entity (length/area/diameter) or the distance and angle between two, picked by model points (mm)."
+    },
+    {
+      "name": "mirror",
+      "description": "Mirror features (by name) about \"front\"/\"top\"/\"right\", a plane name, or the planar face at face_point (mm)."
+    },
+    {
+      "name": "mirror_components",
+      "description": "Mirror assembly components (names as in list_components) about a plane (\"front\"/\"top\"/\"right\" or a plane name):"
+    },
+    {
+      "name": "mirror_part",
+      "description": "Make the opposite-hand version of the active (saved) part as a new part, mirrored about \"front\"/\"top\"/\"right\", a plane name or the planar face at face_point."
+    },
+    {
+      "name": "miter_flange",
+      "description": "Sheet metal miter flange:"
+    },
+    {
+      "name": "model_info",
+      "description": "Mass properties, bounding box and material of the active part or assembly (mass uses the assigned material's density)."
+    },
+    {
+      "name": "move_body",
+      "description": "Move (or copy, copies times) the solid body through body_point ([x,y,z] mm on its surface) by translate [dx,dy,dz] mm and/or rotate [rx,ry,rz] degrees about the point `about` (default the origin)."
+    },
+    {
+      "name": "new_document",
+      "description": "Create a document from the default template set in SOLIDWORKS options."
+    },
+    {
+      "name": "offset_plane",
+      "description": "Create a reference plane `distance` mm from a plane (\"front\"/\"top\"/ \"right\" or a name) or from the planar face at face_point; sketch on it by passing the returned name to sketch(plane=...)."
+    },
+    {
+      "name": "open_document",
+      "description": "Open a .sldprt/.sldasm/.slddrw file and make it active."
+    },
+    {
+      "name": "ordinate_dimensions",
+      "description": "Ordinate (baseline) dimensions in a drawing view (default the first):"
+    },
+    {
+      "name": "pack_and_go",
+      "description": "Copy the active part/assembly (saved) with every file it references into `folder`, optionally renamed with a prefix/suffix, plus the drawings next to those files that show them:"
+    },
+    {
+      "name": "projected_view",
+      "description": "Add a view projected from a drawing view (default the first) to its right/left/top/bottom, aligned with it."
+    },
+    {
+      "name": "rebuild",
+      "description": "Force a full rebuild of the active document and list the features that fail (SOLIDWORKS' What's Wrong list:"
+    },
+    {
+      "name": "reference_axis",
+      "description": "Create a reference axis along x/y/z through the origin (for patterns, revolves or mates)."
+    },
+    {
+      "name": "reference_point",
+      "description": "Reference point at the centre of the face, or of the circular edge, through point ([x,y,z] mm), e.g."
+    },
+    {
+      "name": "rename_feature",
+      "description": "Rename a feature, sketch, plane or mate (names from list_features or list_mates), e.g."
+    },
+    {
+      "name": "replace_component",
+      "description": "Swap an assembly component (name as in list_components) for another part/assembly file, keeping its mates where the new geometry allows."
+    },
+    {
+      "name": "revision_table",
+      "description": "Add a revision row (e.g."
+    },
+    {
+      "name": "revolve",
+      "description": "Revolve a sketch about its centerline (default the most recent sketch)."
+    },
+    {
+      "name": "rib",
+      "description": "Rib from an open sketch (e.g."
+    },
+    {
+      "name": "run_api_script",
+      "description": "Run Python against the live SOLIDWORKS API for anything the other tools do not cover."
+    },
+    {
+      "name": "run_macro",
+      "description": "Run a VBA macro (.swp), e.g."
+    },
+    {
+      "name": "run_steps",
+      "description": "Run several tools in one call, in order, which is much faster than a call each:"
+    },
+    {
+      "name": "save",
+      "description": "Save the active document; with a path (same file type), save it there and keep working on the new file."
+    },
+    {
+      "name": "screenshot",
+      "description": "Image of the active document's graphics area, optionally reoriented."
+    },
+    {
+      "name": "section_view",
+      "description": "Section view cut through a model point ([x,y,z] mm) of a drawing view (default the first, the front view)."
+    },
+    {
+      "name": "set_color",
+      "description": "Colour the whole active part, e.g."
+    },
+    {
+      "name": "set_component",
+      "description": "Change a component of the active assembly (name as in list_components, e.g."
+    },
+    {
+      "name": "set_dimension",
+      "description": "Change a dimension (mm, or degrees for angles) and rebuild."
+    },
+    {
+      "name": "set_drawing_scale",
+      "description": "Set the scale (\"1:2\", \"2:1\", ...) of the active sheet, or of one view (by name, see list_views) so it no longer follows the sheet."
+    },
+    {
+      "name": "set_equation",
+      "description": "Add or replace an equation."
+    },
+    {
+      "name": "set_material",
+      "description": "Assign a material to the active part by its library name, e.g."
+    },
+    {
+      "name": "set_tolerance",
+      "description": "Tolerance of a dimension (name from list_dimensions, e.g."
+    },
+    {
+      "name": "sheet_metal_base_flange",
+      "description": "Start a sheet metal part from a sketch (default the most recent):"
+    },
+    {
+      "name": "shell",
+      "description": "Hollow the part to a wall `thickness` (mm), removing the faces through the given points (e.g."
+    },
+    {
+      "name": "sketch",
+      "description": "Create a sketch and close it."
+    },
+    {
+      "name": "sketch3d",
+      "description": "3D sketch in model coordinates (mm), e.g."
+    },
+    {
+      "name": "sketch_corners",
+      "description": "Round (radius mm) or bevel (chamfer mm, equal distances) corners of an existing sketch (default the most recent), picked by their 2D sketch coordinates [[x,y], ...] mm, like the coordinates given to s"
+    },
+    {
+      "name": "sketch_from_face",
+      "description": "Sketch the outline of the face at face_point ([x,y,z] mm):"
+    },
+    {
+      "name": "sketch_pattern",
+      "description": "Copy features (e.g."
+    },
+    {
+      "name": "sketched_bend",
+      "description": "Sheet metal bend along a line drawn on a flat face, from line_start to line_end ([x,y,z] mm, both on the face; the line may overrun the face)."
+    },
+    {
+      "name": "status",
+      "description": "SOLIDWORKS version, the active document and how much memory and Windows handles SOLIDWORKS uses (it slows down and finally blocks every command with a \"resources low\" dialog when they run out)."
+    },
+    {
+      "name": "structural_member",
+      "description": "Weldment structural member (e.g."
+    },
+    {
+      "name": "suppress_feature",
+      "description": "Suppress or unsuppress a feature, in the active configuration only (default) or in all configurations."
+    },
+    {
+      "name": "surface_finish",
+      "description": "Surface texture symbol with a roughness value (e.g."
+    },
+    {
+      "name": "sweep",
+      "description": "Sweep a closed profile sketch along a path sketch (2D or 3D, by name)."
+    },
+    {
+      "name": "title_block",
+      "description": "Fill in the drawing's title block."
+    },
+    {
+      "name": "trim_members",
+      "description": "Trim weldment members where they run into others:"
+    },
+    {
+      "name": "undo",
+      "description": "Undo the last `steps` operations."
+    },
+    {
+      "name": "variable_fillet",
+      "description": "Variable-radius fillet on the edge through edge_point ([x,y,z] mm), growing from start_radius at one end of the edge to end_radius at the other (mm)."
+    },
+    {
+      "name": "view_style",
+      "description": "Display style of a drawing view (default every view):"
+    },
+    {
+      "name": "weld_symbol",
+      "description": "ISO weld symbol pointing at the model edge through `point` ([x,y,z] mm) in a drawing view (default the first):"
+    },
+    {
+      "name": "weldment_profiles",
+      "description": "Structural profiles available for structural_member:"
+    }
+  ]
+}

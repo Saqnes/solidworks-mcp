@@ -1,0 +1,21 @@
+# Only the server goes into the Claude Desktop extension (.mcpb):
+# manifest.json, pyproject.toml, server.py, sw.py, doctor.py, icon.png, README.md
+.git/
+.gitattributes
+.gitignore
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+docs/
+tests/
+scripts/
+*.swp
+*.cmd
+*.ps1
+AGENTS.md
+CLAUDE.md
+HANDOFF.md
+uv.lock
