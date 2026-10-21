@@ -193,6 +193,23 @@ user in Korean.
     InsertConvertToSheetMetal2 with the same selection kept only the base
     flange. Component configuration = IComponent2.ReferencedConfiguration
     (read back to check).
+28. Surfaces and patterns, found by trying (most of these calls return
+    nothing even when they work: check the newest feature, `_made`):
+    FeatureExtruRefSurface2 (21 args), InsertPlanarRefSurface (no args:
+    `sw.m0`), InsertOffsetSurface and InsertDeleteFace2 take faces mark 0;
+    thicken (FeatureBossThicken/FeatureCutThicken) needs the surface face
+    mark 1; knit (InsertSewRefSurface) needs the sheet bodies mark 1 and
+    UseGapFilters True, or TryToFormSolid is ignored. Split line =
+    InsertSplitLineProject with the sketch mark 4 + faces mark 1.
+    FeatureFillPattern is obsolete and makes nothing: preselect boundary
+    face mark 16384, direction edge mark 1 (required in practice), seed
+    features mark 4, then CreateDefinition(swFmFillPattern) +
+    CreateFeature; a seed cut comes out 8 mm whatever Diameter says, so set
+    Diameter afterwards with GetDefinition/AccessSelections/
+    ModifyDefinition. Curve pattern = IModelDoc2.FeatureCurvePattern with
+    the curve mark 1 + features mark 4 (equal spacing: pass the curve
+    length). `sw.select_at`/list_faces search surface bodies too
+    (`sw.solid_and_surface_bodies`): after delete_face a part has none.
 
 ## Verified on the real SOLIDWORKS
 
@@ -215,7 +232,9 @@ functions, each result checked (volumes, positions, PDFs rendered):
   reference_point, list_faces, list_edges (parts and assembly
   components), run_steps with result references, rebuild_errors,
   document_units, mirror_part, insert_bends, component configurations,
-  the .mcpb bundle (unpacked and run through uv).
+  the .mcpb bundle (unpacked and run through uv); surfaces (extrude,
+  planar, offset, knit to solid, thicken, delete face), split_line,
+  fill_pattern (seed features and seed cut), curve_pattern (edge, sketch).
 - Sheet metal: base flange, edge_flange (90° and 60°), miter_flange along
   two edges, hem.
 - Weldments: structural_member (iso square tube, mitre corners),

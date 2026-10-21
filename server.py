@@ -464,6 +464,10 @@ def model_info() -> dict:
         box = _body_box(doc)
         if box:
             info["bounding_box_mm"] = {"min": [round(v / MM, 4) for v in box[:3]], "max": [round(v / MM, 4) for v in box[3:]]}
+        sheets = list(doc.GetBodies2(1, True) or ())  # surface bodies have area but no volume
+        if sheets:
+            info["surface_bodies"] = len(sheets)
+            info["surface_body_area_mm2"] = round(sum(sw.m0(f, "GetArea") for b in sheets for f in b.GetFaces() or ()) / MM**2, 3)
         db = sw.out_bstr()
         info["material"] = doc.GetMaterialPropertyName2("", db) or None
     return info
@@ -473,10 +477,10 @@ VIEWS = {"front": 1, "back": 2, "left": 3, "right": 4, "top": 5, "bottom": 6, "i
 
 
 def _body_box(doc: Any) -> list[float] | None:
-    """Box (m) around the part's solid bodies; GetPartBox also counts
-    sketches and reference geometry."""
+    """Box (m) around the part's solid and surface bodies; GetPartBox also
+    counts sketches and reference geometry."""
     try:
-        boxes = [b.GetBodyBox() for b in doc.GetBodies2(0, True) or ()]
+        boxes = [b.GetBodyBox() for b in sw.solid_and_surface_bodies(doc, True)]
     except Exception:
         boxes = []  # bodies that cannot report a box: fall back to the part box
     if not boxes:
@@ -514,14 +518,14 @@ class _Placement:
 
 def _bodies_with_placement(doc: Any, component: str) -> list[tuple[str | None, Any, _Placement]]:
     if sw.m0(doc, "GetType") == DOC_PART:
-        return [(None, b, _Placement()) for b in doc.GetBodies2(0, False) or ()]
+        return [(None, b, _Placement()) for b in sw.solid_and_surface_bodies(doc, False)]
     comps = [_component(doc, component)] if component else list(doc.GetComponents(False) or ())
     out = []
     for comp in comps:
         if sw.m0(comp, "IsSuppressed"):
             continue
         place = _Placement(comp)
-        out.extend((comp.Name2, b, place) for b in comp.GetBodies2(0) or ())
+        out.extend((comp.Name2, b, place) for b in sw.solid_and_surface_bodies(comp))
     return out
 
 
@@ -3357,6 +3361,130 @@ def circular_pattern(features: list[str], count: int, axis: str = "y", angle: fl
     return _feature_result(feat, "circular pattern")
 
 
+FILL_LAYOUTS = {"perforation": "swPatternLayoutPerforation", "square": "swPatternLayoutSquare",
+                "circular": "swPatternLayoutCircular", "polygon": "swPatternLayoutPolygon"}
+
+
+def _longest_line(face: Any) -> Any:
+    best, length = None, 0.0
+    for edge in sw.m0(face, "GetEdges") or ():
+        curve = sw.m0(edge, "GetCurve")
+        if not sw.invoke(curve, "IsLine"):
+            continue
+        p = sw.m0(edge, "GetCurveParams2")
+        n = curve.GetLength3(p[6], p[7])
+        if n > length:
+            best, length = edge, n
+    return best
+
+
+def _round_holes(doc: Any, feature: str) -> int:
+    return sum(1 for b in doc.GetBodies2(0, False) or () for f in b.GetFaces() or ()
+               if getattr(sw.m0(f, "GetFeature"), "Name", None) == feature and sw.invoke(sw.m0(f, "GetSurface"), "IsCylinder"))
+
+
+@tool
+def fill_pattern(face_point: list[float], spacing: float, features: list[str] | None = None,
+                 hole_diameter: float = 0.0, layout: Literal["perforation", "square", "circular", "polygon"] = "perforation",
+                 margin: float = 0.0, stagger_angle: float = 60.0, polygon_sides: int = 6,
+                 direction_edge_point: list[float] | None = None) -> dict:
+    """Fill the planar face at face_point with copies of features (e.g. a
+    hole made first), or with round holes of hole_diameter mm cut through
+    when no features are given: a perforated or vented plate. spacing (mm)
+    between instance centres; perforation rows are staggered by
+    stagger_angle; margin keeps them that far inside the face edges;
+    direction_edge_point sets the row direction (default the face's longest
+    straight edge)."""
+    if not features and hole_diameter <= 0:
+        raise ValueError("Give features to copy, or a hole_diameter to cut")
+    doc = sw.active_doc(DOC_PART)
+    v0 = _body_totals(doc)["volume_mm3"]
+    # selections before CreateDefinition: boundary mark 16384, direction mark 1, seed features mark 4
+    doc.ClearSelection2(True)
+    sw.select_at(doc, "FACE", face_point, False, 16384)
+    if direction_edge_point:
+        sw.select_at(doc, "EDGE", direction_edge_point, True, 1)
+    else:  # without a direction CreateFeature makes nothing (though the API help calls it optional)
+        edge = _longest_line(sw.nearest(doc, "face", face_point)[1])
+        if edge is None:
+            raise ValueError("The face has no straight edge; give direction_edge_point")
+        _pick(doc, edge, 1, True)
+    for name in features or ():
+        sw.select_feature(doc, name, append=True, mark=4)
+    fm = doc.FeatureManager
+    data = fm.CreateDefinition(sw.constant("swFmFillPattern"))
+    if data is None:
+        raise RuntimeError("SOLIDWORKS could not start a fill pattern")
+    data.PatternLayoutType = sw.constant(FILL_LAYOUTS[layout])
+    data.LayoutSpacingType = sw.constant("swPatternLayoutTargetSpacing")
+    data.InstanceSpacing = mm(spacing)
+    if layout == "perforation":
+        data.StaggerAngle = deg(stagger_angle)
+    else:
+        data.LoopSpacing = mm(spacing)
+    if layout == "polygon":
+        data.PatternLayoutPolygonSides = polygon_sides
+    data.Margins = mm(margin)
+    if features:
+        data.FeaturesToPatternType = sw.constant("swFeaturesToPatternSelectedFeatures")
+    else:
+        data.FeaturesToPatternType = sw.constant("swFeaturesToPatternCreateSeedCut")
+        data.CreateSeedCutType = sw.constant("swCreateSeedCutCircle")
+    data.GeometryPattern = False
+    feat = fm.CreateFeature(data)
+    result = _feature_result(feat, "fill pattern")
+    if not features:  # CreateFeature cuts 8 mm holes whatever Diameter says; set it afterwards
+        definition = sw.m0(feat, "GetDefinition")
+        definition.AccessSelections(doc, sw.nothing())
+        definition.Diameter = mm(hole_diameter)
+        if not feat.ModifyDefinition(definition, doc, sw.nothing()):
+            sw.m0(definition, "ReleaseSelectionAccess")
+            raise RuntimeError(f"Made the fill pattern but could not set the {hole_diameter} mm hole size")
+    result["volume_change_mm3"] = round(_body_totals(doc)["volume_mm3"] - v0, 3)
+    result["round_holes_made"] = _round_holes(doc, feat.Name)
+    return result
+
+
+def _curve_length(doc: Any, curve_point: list[float] | None, curve_sketch: str) -> float:
+    if curve_sketch:
+        sk = sw.m0(sw.feature(doc, curve_sketch), "GetSpecificFeature2")
+        return sum(sw.m0(seg, "GetLength") for seg in sw.m0(sk, "GetSketchSegments") or ())
+    edge = sw.nearest(doc, "edge", curve_point)[1]
+    params = sw.m0(edge, "GetCurveParams2")
+    return sw.m0(edge, "GetCurve").GetLength3(params[6], params[7])
+
+
+@tool
+def curve_pattern(features: list[str], count: int, curve_point: list[float] | None = None, curve_sketch: str = "",
+                  spacing: float = 0.0, reverse: bool = False, align_to_seed: bool = False) -> dict:
+    """Copy features along a curve: the edge through curve_point (e.g. a
+    hole's rim or a part outline) or a sketch curve_sketch. count includes
+    the original; spacing 0 spreads them evenly over the whole curve,
+    otherwise spacing mm apart. Copies turn with the curve unless
+    align_to_seed."""
+    if not curve_point and not curve_sketch:
+        raise ValueError("Give the curve: curve_point (an edge) or curve_sketch")
+    doc = sw.active_doc(DOC_PART)
+    v0 = _body_totals(doc)["volume_mm3"]
+    doc.ClearSelection2(True)
+    if curve_sketch:
+        sw.select_feature(doc, curve_sketch, mark=1)  # curve: mark 1, features: mark 4
+    else:
+        sw.select_at(doc, "EDGE", curve_point, False, 1)
+    for name in features:
+        sw.select_feature(doc, name, append=True, mark=4)
+    even = spacing <= 0
+    step = _curve_length(doc, curve_point, curve_sketch) if even else mm(spacing)  # even: the whole curve
+    last = doc.FeatureByPositionReverse(0).Name
+    # Num1, Spacing1, Num2, Spacing2, flips, equal spacing 1/2, use centroid, align to seed,
+    # offset curve (keeps the seed's distance to the curve), pattern seed only.
+    # It returns nothing even when it builds the pattern: look at the tree.
+    doc.FeatureCurvePattern(count, step, 1, 0, reverse, False, even, True, False, align_to_seed, True, False)
+    result = _made(doc, last, ("CurvePattern",), "curve pattern")
+    result["volume_change_mm3"] = round(_body_totals(doc)["volume_mm3"] - v0, 3)
+    return result
+
+
 @tool
 def sketch_pattern(features: list[str], sketch_name: str, use_centroid: bool = True) -> dict:
     """Copy features (e.g. a hole cut) to every point of a sketch (made with
@@ -4746,6 +4874,173 @@ def rib(thickness: float, sketch_name: str = "", both_sides: bool = True, flip_m
     after = sw.m0(doc, "GetMassProperties")
     if before and after:
         result["volume_added_mm3"] = round((after[3] - before[3]) / MM**3, 2)
+    return result
+
+
+# --- Surfaces -----------------------------------------------------------------
+
+
+def _body_totals(doc: Any) -> dict:
+    """Solid volume (mm3), surface body count and area (mm2) of a part."""
+    solids = list(doc.GetBodies2(0, False) or ())
+    sheets = list(doc.GetBodies2(1, False) or ())
+    return {
+        "solid_bodies": len(solids),
+        "volume_mm3": round(sum(b.GetMassProperties(1.0)[3] for b in solids) / MM**3, 3),
+        "surface_bodies": len(sheets),
+        "surface_area_mm2": round(sum(sw.m0(f, "GetArea") for b in sheets for f in b.GetFaces() or ()) / MM**2, 3),
+    }
+
+
+def _made(doc: Any, last: str, kinds: tuple[str, ...], what: str) -> dict:
+    """The feature a call made (several surface calls return nothing even
+    when they work): the newest one, if it is new and of the right type."""
+    newest = doc.FeatureByPositionReverse(0)
+    if newest is None or newest.Name == last or sw.m0(newest, "GetTypeName2") not in kinds:
+        raise RuntimeError(f"SOLIDWORKS did not create the {what}; check the selection (list_faces, screenshot)")
+    return {"feature": newest.Name, "type": sw.m0(newest, "GetTypeName2")}
+
+
+def _with_totals(doc: Any, result: dict, before: dict) -> dict:
+    after = _body_totals(doc)
+    result.update(after)
+    result["volume_change_mm3"] = round(after["volume_mm3"] - before["volume_mm3"], 3)
+    result["surface_area_change_mm2"] = round(after["surface_area_mm2"] - before["surface_area_mm2"], 3)
+    return result
+
+
+@tool
+def surface_extrude(depth: float, sketch_name: str = "", both_sides: bool = False, reverse: bool = False,
+                    cap_ends: bool = False) -> dict:
+    """Extruded surface (a sheet without volume) from a sketch, open or
+    closed (default the most recent sketch), depth mm along the sketch's
+    normal; both_sides extrudes depth each way, reverse flips, cap_ends
+    closes the ends of a closed profile."""
+    doc = sw.active_doc(DOC_PART)
+    sketch_name = sketch_name or _last_sketch_name(doc)
+    before = _body_totals(doc)
+    doc.ClearSelection2(True)
+    sw.select_feature(doc, sketch_name)
+    last = doc.FeatureByPositionReverse(0).Name
+    d = mm(depth)
+    # Sd, Flip, Dir, T1, T2 (blind), D1, D2, draft flags/angles, offsets, translate, CapEnd1, CapEnd2, delete face, knit
+    doc.FeatureManager.FeatureExtruRefSurface2(not both_sides, reverse, False, 0, 0, d, d if both_sides else 0,
+                                               False, False, False, False, 0, 0, False, False, False, False,
+                                               cap_ends, cap_ends, False, False)
+    return _with_totals(doc, _made(doc, last, ("ExtruRefSurface",), "extruded surface"), before)
+
+
+@tool
+def planar_surface(sketch_name: str = "", edge_points: list[list[float]] | None = None) -> dict:
+    """Flat surface filling a closed sketch (default the most recent sketch),
+    or the closed loop of planar edges through edge_points ([[x,y,z], ...]
+    mm), e.g. to patch the opening left by delete_face."""
+    doc = sw.active_doc(DOC_PART)
+    before = _body_totals(doc)
+    doc.ClearSelection2(True)
+    if edge_points:
+        for p in edge_points:
+            sw.select_at(doc, "EDGE", p, True)
+    else:
+        sw.select_feature(doc, sketch_name or _last_sketch_name(doc))
+    last = doc.FeatureByPositionReverse(0).Name
+    sw.m0(doc, "InsertPlanarRefSurface")  # parameterless: late binding runs it on attribute access
+    return _with_totals(doc, _made(doc, last, ("PlanarSurface",), "planar surface"), before)
+
+
+@tool
+def offset_surface(face_points: list[list[float]], distance: float, reverse: bool = False) -> dict:
+    """Surface offset distance mm from the faces through face_points
+    (outward; reverse = inward). distance 0 copies the faces as a surface."""
+    doc = sw.active_doc(DOC_PART)
+    before = _body_totals(doc)
+    doc.ClearSelection2(True)
+    for p in face_points:
+        sw.select_at(doc, "FACE", p, True)
+    last = doc.FeatureByPositionReverse(0).Name
+    doc.InsertOffsetSurface(mm(distance), reverse)
+    return _with_totals(doc, _made(doc, last, ("OffsetRefSurface",), "offset surface"), before)
+
+
+@tool
+def knit_surfaces(form_solid: bool = True, gap_tolerance: float = 0.1) -> dict:
+    """Knit every surface body of the part into one; form_solid turns a
+    closed result into a solid body. gap_tolerance (mm) bridges small gaps."""
+    doc = sw.active_doc(DOC_PART)
+    sheets = list(doc.GetBodies2(1, False) or ())
+    if not sheets:
+        raise ValueError("The part has no surface bodies to knit")
+    before = _body_totals(doc)
+    doc.ClearSelection2(True)
+    data = sw.m0(doc.SelectionManager, "CreateSelectData")
+    data.Mark = 1  # surfaces to knit: mark 1 (mark 0 is ignored)
+    for body in sheets:
+        body.Select2(True, data)
+    last = doc.FeatureByPositionReverse(0).Name
+    tol = mm(gap_tolerance)
+    # gap filters on (needed for TryToFormSolid to take effect), form solid, merge entities
+    doc.FeatureManager.InsertSewRefSurface(True, form_solid, True, tol, tol)
+    result = _with_totals(doc, _made(doc, last, ("SewRefSurface",), "knit"), before)
+    if form_solid and result["solid_bodies"] <= before["solid_bodies"]:
+        result["note"] = "knitted, but not closed enough to become a solid; patch the openings (planar_surface)"
+    return result
+
+
+THICKEN_SIDES = {"side1": "swThickenSideOne", "side2": "swThickenSideTwo", "both": "swThickenSideBoth"}
+
+
+@tool
+def thicken(face_point: list[float], thickness: float, side: Literal["side1", "side2", "both"] = "side1",
+            cut: bool = False) -> dict:
+    """Make a solid from the surface through face_point by giving it
+    thickness mm (side1/side2 of the surface or both); cut=true removes that
+    slab from the solid instead."""
+    doc = sw.active_doc(DOC_PART)
+    before = _body_totals(doc)
+    doc.ClearSelection2(True)
+    sw.select_at(doc, "FACE", face_point, False, 1)  # the surface: mark 1 (mark 0 makes nothing)
+    direction = sw.constant(THICKEN_SIDES[side])
+    fm = doc.FeatureManager
+    if cut:
+        feat = fm.FeatureCutThicken(mm(thickness), direction, 0, False, True, True)
+    else:
+        feat = fm.FeatureBossThicken(mm(thickness), direction, 0, False, True, True, True)
+    return _with_totals(doc, _feature_result(feat, "thicken"), before)
+
+
+@tool
+def delete_face(face_points: list[list[float]], patch: bool = False) -> dict:
+    """Delete the faces through face_points. A solid becomes an open surface
+    body (patch it with planar_surface and knit_surfaces), unless
+    patch=true, which lets the neighbouring faces grow over the hole."""
+    doc = sw.active_doc(DOC_PART)
+    before = _body_totals(doc)
+    doc.ClearSelection2(True)
+    for p in face_points:
+        sw.select_at(doc, "FACE", p, True)
+    last = doc.FeatureByPositionReverse(0).Name
+    if not doc.InsertDeleteFace2(patch):
+        raise RuntimeError("SOLIDWORKS could not delete those faces" + (" and patch the gap" if patch else ""))
+    return _with_totals(doc, _made(doc, last, ("DelFace",), "delete face"), before)
+
+
+@tool
+def split_line(sketch_name: str, face_points: list[list[float]], one_direction: bool = False,
+               reverse: bool = False) -> dict:
+    """Project a sketch (e.g. a circle or outline on a plane above the part)
+    onto the faces through face_points and split them along it, e.g. for a
+    separate area to colour, draft or mate to."""
+    doc = sw.active_doc(DOC_PART)
+    count = lambda: sum(len(b.GetFaces() or ()) for b in sw.solid_and_surface_bodies(doc, False))  # noqa: E731
+    faces_before = count()
+    doc.ClearSelection2(True)
+    sw.select_feature(doc, sketch_name, mark=4)  # sketch to project: mark 4, faces: mark 1
+    for p in face_points:
+        sw.select_at(doc, "FACE", p, True, 1)
+    last = doc.FeatureByPositionReverse(0).Name
+    doc.InsertSplitLineProject(one_direction, reverse)
+    result = _made(doc, last, ("PLine",), "split line")
+    result["faces_added"] = count() - faces_before
     return result
 
 

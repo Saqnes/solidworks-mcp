@@ -456,9 +456,16 @@ def _nearest_on_bodies(bodies: Any, entity: str, p: tuple[float, float, float]) 
     return best
 
 
+def solid_and_surface_bodies(owner: Any, *args: Any) -> list:
+    """Solid bodies and surface (sheet) bodies of a part or component: a
+    part with its top face deleted, or a surface model, has no solid body
+    left to pick from."""
+    return list(owner.GetBodies2(0, *args) or ()) + list(owner.GetBodies2(1, *args) or ())
+
+
 def nearest(doc: Any, entity: str, point_mm: list[float]) -> tuple[float, Any]:
     """(distance m, entity) of the part's face/edge/vertex nearest a point (mm)."""
-    return _nearest_on_bodies(doc.GetBodies2(0, False), entity, tuple(mm(v) for v in point_mm))
+    return _nearest_on_bodies(solid_and_surface_bodies(doc, False), entity, tuple(mm(v) for v in point_mm))
 
 
 def nearest_in_assembly(asm: Any, entity: str, point_mm: list[float]) -> tuple[float, Any]:
@@ -473,7 +480,7 @@ def nearest_in_assembly(asm: Any, entity: str, point_mm: list[float]) -> tuple[f
         try:
             pt = invoke(mu, "CreatePoint", doubles([mm(v) for v in point_mm]))
             local = tuple(m0(invoke(pt, "MultiplyTransform", m0(comp.Transform2, "Inverse")), "ArrayData"))[:3]
-            cand = _nearest_on_bodies(comp.GetBodies2(0), entity, local)
+            cand = _nearest_on_bodies(solid_and_surface_bodies(comp), entity, local)
         except Exception:
             continue  # a lightweight or empty component: nothing to pick there
         best = min(best, cand, key=lambda c: c[0])

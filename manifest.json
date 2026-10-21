@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "solidworks-mcp",
   "display_name": "SOLIDWORKS",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "SOLIDWORKS(2025)를 Claude에서 조작합니다: 파트 모델링, 판금, 용접 구조물, 어셈블리 메이트, 도면과 PDF/DXF 내보내기.",
   "long_description": "실행 중인 SOLIDWORKS를 COM API로 조작하는 MCP 서버입니다. 스케치·돌출·구멍 가공 마법사·필렛, 판금과 용접 구조물, 어셈블리 메이트(슬롯·힌지·기어 등), 도면(치수·공차·표제란·BOM)과 PDF/DXF/STEP 내보내기를 도구 130여 개로 제공합니다. 한글 UI와 Windows 전용입니다. 처음 켤 때 Python 패키지를 내려받느라 1~2분 걸릴 수 있습니다.",
   "author": {
@@ -155,6 +155,10 @@
       "description": "Cosmetic thread on a cylinder (a shaft's outside or a plain hole), starting at the circular edge through edge_point ([x,y,z] mm)."
     },
     {
+      "name": "curve_pattern",
+      "description": "Copy features along a curve:"
+    },
+    {
       "name": "custom_properties",
       "description": "Read the document's custom properties, after first adding/replacing any given in set_values (e.g."
     },
@@ -173,6 +177,10 @@
     {
       "name": "delete_equation",
       "description": "Remove the equation or global variable whose left side is `lhs`."
+    },
+    {
+      "name": "delete_face",
+      "description": "Delete the faces through face_points."
     },
     {
       "name": "delete_feature",
@@ -255,6 +263,10 @@
       "description": "Face fillet of `radius` mm blending two faces (points on each, [x,y,z] mm); unlike an edge fillet the faces need not share an edge."
     },
     {
+      "name": "fill_pattern",
+      "description": "Fill the planar face at face_point with copies of features (e.g."
+    },
+    {
       "name": "fillet",
       "description": "Constant-radius fillet on the edges passing through the given model points ([[x,y,z], ...] in mm; a point on the edge, e.g."
     },
@@ -301,6 +313,10 @@
     {
       "name": "insert_component",
       "description": "Insert a part/assembly file into the active assembly with its origin at position [x,y,z] mm (default the assembly origin), turned by rotation [about x, about y, about z] degrees (applied in that order"
+    },
+    {
+      "name": "knit_surfaces",
+      "description": "Knit every surface body of the part into one; form_solid turns a closed result into a solid body."
     },
     {
       "name": "linear_pattern",
@@ -395,6 +411,10 @@
       "description": "Create a reference plane `distance` mm from a plane (\"front\"/\"top\"/ \"right\" or a name) or from the planar face at face_point; sketch on it by passing the returned name to sketch(plane=...)."
     },
     {
+      "name": "offset_surface",
+      "description": "Surface offset distance mm from the faces through face_points (outward; reverse = inward)."
+    },
+    {
       "name": "open_document",
       "description": "Open a .sldprt/.sldasm/.slddrw file and make it active."
     },
@@ -405,6 +425,10 @@
     {
       "name": "pack_and_go",
       "description": "Copy the active part/assembly (saved) with every file it references into `folder`, optionally renamed with a prefix/suffix, plus the drawings next to those files that show them:"
+    },
+    {
+      "name": "planar_surface",
+      "description": "Flat surface filling a closed sketch (default the most recent sketch), or the closed loop of planar edges through edge_points ([[x,y,z], ...] mm), e.g."
     },
     {
       "name": "projected_view",
@@ -527,6 +551,10 @@
       "description": "Sheet metal bend along a line drawn on a flat face, from line_start to line_end ([x,y,z] mm, both on the face; the line may overrun the face)."
     },
     {
+      "name": "split_line",
+      "description": "Project a sketch (e.g."
+    },
+    {
       "name": "status",
       "description": "SOLIDWORKS version, the active document and how much memory and Windows handles SOLIDWORKS uses (it slows down and finally blocks every command with a \"resources low\" dialog when they run out)."
     },
@@ -539,12 +567,20 @@
       "description": "Suppress or unsuppress a feature, in the active configuration only (default) or in all configurations."
     },
     {
+      "name": "surface_extrude",
+      "description": "Extruded surface (a sheet without volume) from a sketch, open or closed (default the most recent sketch), depth mm along the sketch's normal; both_sides extrudes depth each way, reverse flips, cap_end"
+    },
+    {
       "name": "surface_finish",
       "description": "Surface texture symbol with a roughness value (e.g."
     },
     {
       "name": "sweep",
       "description": "Sweep a closed profile sketch along a path sketch (2D or 3D, by name)."
+    },
+    {
+      "name": "thicken",
+      "description": "Make a solid from the surface through face_point by giving it thickness mm (side1/side2 of the surface or both); cut=true removes that slab from the solid instead."
     },
     {
       "name": "title_block",

@@ -3,7 +3,7 @@
     .venv\\Scripts\\python tests\\live\\run_live.py            all groups
     .venv\\Scripts\\python tests\\live\\run_live.py parts holes   only some groups
 
-Groups: parts, holes, sheetmetal, weldment, assembly, drawing.
+Groups: parts, surfaces, holes, sheetmetal, weldment, assembly, drawing.
 
 Builds small test models in a temporary folder through the server's own
 tool functions and compares what comes out with hand-computed numbers
@@ -213,6 +213,61 @@ def parts() -> None:
           f"{com} -> {m['center_of_mass_mm']}")
 
 
+def surfaces() -> None:
+    new()
+    S.sketch([{"type": "line", "x1": 0, "y1": 0, "x2": 20, "y2": 0}, {"type": "line", "x1": 20, "y1": 0, "x2": 20, "y2": 10}],
+             plane="front", dimension=False)
+    near("extruded surface area ((20 + 10) x 30)", S.surface_extrude(30)["surface_area_change_mm2"], 900, 0.01)
+    S.sketch([{"type": "center_rectangle", "cx": 60, "cy": 0, "width": 40, "height": 20}], plane="top", dimension=False)
+    near("planar surface area (40 x 20)", S.planar_surface()["surface_area_change_mm2"], 800, 0.01)
+    near("thicken the planar surface 3 mm", S.thicken([60, 0, 0], 3)["volume_change_mm3"], 2400, 0.01)
+
+    new()
+    S.sketch([{"type": "center_rectangle", "cx": 0, "cy": 0, "width": 30, "height": 20}], plane="top")
+    S.extrude(depth=10)
+    near("offset surface of the top face", S.offset_surface([[0, 10, 0]], 5)["surface_area_change_mm2"], 600, 0.01)
+    opened = S.delete_face([[0, 10, 0]])
+    check("delete_face leaves an open surface body", opened["solid_bodies"] == 0 and opened["surface_bodies"] == 2, str(opened))
+    S.planar_surface(edge_points=[[0, 10, 10], [0, 10, -10], [15, 10, 0], [-15, 10, 0]])
+    S.delete_feature([f["name"] for f in S.list_features() if f["type"] == "OffsetRefSurface"][0])
+    knit = S.knit_surfaces()
+    near("knit the patched box back into a solid", knit["volume_mm3"], 6000, 0.01)
+
+    new()
+    S.sketch([{"type": "center_rectangle", "cx": 0, "cy": 0, "width": 60, "height": 40}], plane="top")
+    S.extrude(depth=10)
+    plane = S.offset_plane(20, "top")["feature"]
+    ring = S.sketch([{"type": "circle", "cx": 0, "cy": 0, "r": 10}], plane=plane, dimension=False)["sketch"]
+    check("split line adds a face", S.split_line(ring, [[20, 10, 10]])["faces_added"] == 1)
+
+    new()  # a 100 x 60 x 5 plate with one 4 mm hole as the seed
+    S.sketch([{"type": "center_rectangle", "cx": 0, "cy": 0, "width": 100, "height": 60}], plane="top")
+    S.extrude(depth=5)
+    S.sketch([{"type": "circle", "cx": -40, "cy": 0, "r": 2}], face_point=[0, 5, 0])
+    seed = S.extrude(depth=5, cut=True, end="through_all")["feature"]
+    fill = S.fill_pattern([10, 5, 10], 10, features=[seed], margin=3, direction_edge_point=[0, 5, 30])
+    hole = math.pi * 4 * 5
+    check("fill pattern copies the hole across the plate", fill["round_holes_made"] >= 30, str(fill))
+    near("fill pattern volume = its holes", fill["volume_change_mm3"], -fill["round_holes_made"] * hole, 0.05)
+
+    new()
+    S.sketch([{"type": "center_rectangle", "cx": 0, "cy": 0, "width": 60, "height": 40}], plane="top")
+    S.extrude(depth=5)
+    cut = S.fill_pattern([0, 5, 0], 10, hole_diameter=4, margin=3)
+    radii = {f["radius_mm"] for f in S.list_faces(type="cylinder")["faces"]}
+    check("fill pattern seed cut: 4 mm holes", radii == {2.0} and cut["round_holes_made"] >= 10, f"{radii}, {cut}")
+
+    new()  # a ring of 8 holes around a 40 mm hole, along its rim
+    S.sketch([{"type": "center_rectangle", "cx": 0, "cy": 0, "width": 100, "height": 100}], plane="top")
+    S.extrude(depth=5)
+    S.sketch([{"type": "circle", "cx": 0, "cy": 0, "r": 20}], face_point=[30, 5, 30])
+    S.extrude(depth=5, cut=True, end="through_all")
+    S.sketch([{"type": "circle", "cx": 30, "cy": 0, "r": 3}], face_point=[30, 5, 30])
+    seed = S.extrude(depth=5, cut=True, end="through_all")["feature"]
+    ring = S.curve_pattern([seed], 8, curve_point=[20, 5, 0])
+    near("curve pattern: 7 more holes on the rim", ring["volume_change_mm3"], -7 * math.pi * 9 * 5, 0.05)
+
+
 def holes() -> None:
     new()
     S.sketch([{"type": "center_rectangle", "cx": 0, "cy": 0, "width": 200, "height": 120}], plane="top")
@@ -384,7 +439,7 @@ def drawing() -> None:
     check("drawing PDF written", out["bytes"] > 10000, f"{out['bytes']} bytes, {out.get('method', 'export')}")
 
 
-GROUPS = {"parts": parts, "holes": holes, "sheetmetal": sheetmetal, "weldment": weldment,
+GROUPS = {"parts": parts, "surfaces": surfaces, "holes": holes, "sheetmetal": sheetmetal, "weldment": weldment,
           "assembly": assembly, "drawing": drawing}
 
 
