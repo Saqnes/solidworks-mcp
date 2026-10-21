@@ -160,6 +160,21 @@ user in Korean.
     tool uses it. After ~140 documents made and closed in one session
     (9 GB), SOLIDWORKS answered every command with a modal "Windows
     resources are very low" dialog; only a restart helps (`status` warns).
+26. Inside a tool, call other tools through `TOOLS[name]` / `tool.__wrapped__`:
+    the decorated tool goes through `sw.call`, which would wait forever on
+    the one COM thread it is already running on. `run_steps` runs
+    `TOOLS` entries in one COM call; every tool's dict result gets
+    `rebuild_errors` from IModelDocExtension.GetWhatsWrong (three ByRef
+    VT_VARIANT arrays) when the What's Wrong list is not empty. A test
+    "broken" model must really fail: an R100 fillet on a plain 60x40 plate
+    rebuilt fine (it cut half the plate away); next to a hole it fails.
+    Face points for list_faces = centre of the largest GetTessTriangles
+    triangle (a box centre can fall into a hole); plane normals from
+    IFace2.Normal (PlaneParams with FaceInSurfaceSense came out flipped).
+    Component bodies are in part space: map with the component's
+    Transform2 (`_Placement`). IPartDoc.MirrorPart2(BreakLink, Options,
+    ByRef ResultPart) with a plane selected makes the opposite-hand part
+    as a new active document (feature "MirrorStock").
 
 ## Verified on the real SOLIDWORKS
 
@@ -179,7 +194,9 @@ functions, each result checked (volumes, positions, PDFs rendered):
 - Also: revolve (+ cut), chamfer, shell, circular_pattern, mirror, loft,
   rib, check_interference, export_flat_pattern bend lines, rename_feature,
   helix (+ spring sweep), coordinate_system, sketch_pattern,
-  reference_point.
+  reference_point, list_faces, list_edges (parts and assembly
+  components), run_steps with result references, rebuild_errors,
+  document_units, mirror_part.
 - Sheet metal: base flange, edge_flange (90° and 60°), miter_flange along
   two edges, hem.
 - Weldments: structural_member (iso square tube, mitre corners),
@@ -216,4 +233,5 @@ Macro recordings and argument tables: `docs/recordings/HANDOFF.md`.
    add_mate asks for the tab's two side faces.
 4. Sheet metal jog: no working API path found (see rule 20); a second
    sketched bend on a bent flange fails for the same fixed-face reason.
-5. mirror_components makes instances only, not opposite-hand parts.
+5. mirror_components makes instances only, not opposite-hand parts; make
+   the opposite-hand part with mirror_part, save it and insert it instead.

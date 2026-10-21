@@ -41,7 +41,11 @@ mcp = MCPServer(
         "Sketch coordinates (x, y) on the default planes are model (x, y, 0) on front, "
         "(x, 0, -y) on top and (0, y, -x) on right; extrudes go along +z, +y and +x.\n"
         "Faces, edges and vertices are picked by a model point on them (within 0.5 mm; "
-        "hidden ones too): work points out from model_info's bounding box.\n"
+        "hidden ones too): take the points from list_faces / list_edges (they also give "
+        "normals, axes, radii and the feature that made each face).\n"
+        "Chain several tools in one run_steps call (\"$N.key\" passes step N's result on): "
+        "much faster than one call per step. Results carry rebuild_errors when a feature "
+        "fails to rebuild.\n"
         "Names of planes, features, views and components are localized (the UI may be "
         "Korean: 정면/윗면/우측면, 도면뷰1): take them from list_features, list_views and "
         "list_components instead of guessing.\n"
@@ -62,15 +66,51 @@ def tool(fn=None, *, timeout: float | None = None):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             try:
-                return call(lambda: fn(*args, **kwargs), timeout)
+                return call(lambda: _with_rebuild_errors(fn(*args, **kwargs)), timeout)
             except ToolError:
                 raise
             except Exception as exc:
                 raise ToolError(f"{type(exc).__name__}: {exc}") from exc
 
+        TOOLS[fn.__name__] = fn
         return mcp.tool()(wrapper)
 
     return register(fn) if fn is not None else register
+
+
+TOOLS: dict[str, Any] = {}  # tool name -> plain function (runs on the COM thread), for run_steps
+
+
+def _feature_errors(doc: Any) -> list[dict]:
+    """Features SOLIDWORKS flags with rebuild errors or warnings (its
+    What's Wrong list)."""
+    import pythoncom
+    from win32com.client import VARIANT
+
+    if not sw.m0(doc.Extension, "GetWhatsWrongCount"):
+        return []
+    feats, codes, warns = (VARIANT(pythoncom.VT_BYREF | pythoncom.VT_VARIANT, None) for _ in range(3))
+    doc.Extension.GetWhatsWrong(feats, codes, warns)
+    names = sw.enum_names("swFeatureError_e")
+    out = []
+    for feat, code, warning in zip(feats.value or (), codes.value or (), warns.value or ()):
+        name = names.get(code, str(code)).replace("swFeatureError", "") or "Unknown"
+        out.append({"feature": feat.Name, "error": name, "warning": bool(warning)})
+    return out
+
+
+def _with_rebuild_errors(result: Any) -> Any:
+    """Add the active document's rebuild errors to a tool's dict result, so
+    a change that broke a feature (a fillet too big after set_dimension) is
+    reported instead of looking like a success."""
+    if not isinstance(result, dict) or "rebuild_errors" in result:
+        return result
+    try:
+        doc = sw.app().ActiveDoc
+        errors = _feature_errors(doc) if doc is not None else []
+    except Exception:
+        return result
+    return {**result, "rebuild_errors": errors} if errors else result
 
 
 def _rebuild(doc: Any) -> None:
@@ -425,6 +465,158 @@ def _body_box(doc: Any) -> list[float] | None:
     return [min(b[i] for b in boxes) for i in range(3)] + [max(b[i] for b in boxes) for i in range(3, 6)]
 
 
+def _mm3(p: Any) -> list[float]:
+    return [round(v / MM, 3) + 0.0 for v in p]
+
+
+def _unit3(v: Any) -> list[float]:
+    return [round(c, 4) + 0.0 for c in v]
+
+
+class _Placement:
+    """Maps a component's geometry (in its own part space) into the
+    assembly: ArrayData holds the component's X, Y, Z axes, then its origin."""
+
+    def __init__(self, comp: Any = None):
+        data = list(sw.m0(comp.Transform2, "ArrayData")) if comp is not None else None
+        self.axes = [data[0:3], data[3:6], data[6:9]] if data else None
+        self.origin = data[9:12] if data else None
+
+    def direction(self, v: Any) -> list[float]:
+        if self.axes is None:
+            return list(v)
+        return [sum(v[i] * self.axes[i][k] for i in range(3)) for k in range(3)]
+
+    def point(self, p: Any) -> list[float]:
+        if self.axes is None:
+            return list(p)
+        return [c + o for c, o in zip(self.direction(p), self.origin)]
+
+
+def _bodies_with_placement(doc: Any, component: str) -> list[tuple[str | None, Any, _Placement]]:
+    if sw.m0(doc, "GetType") == DOC_PART:
+        return [(None, b, _Placement()) for b in doc.GetBodies2(0, False) or ()]
+    comps = [_component(doc, component)] if component else list(doc.GetComponents(False) or ())
+    out = []
+    for comp in comps:
+        if sw.m0(comp, "IsSuppressed"):
+            continue
+        place = _Placement(comp)
+        out.extend((comp.Name2, b, place) for b in comp.GetBodies2(0) or ())
+    return out
+
+
+def _inside_point(face: Any) -> list[float] | None:
+    """A point well inside a face (m): the centre of its largest display
+    triangle, so a hole or a narrow strip of the face does not mislead."""
+    tri = face.GetTessTriangles(True)
+    best, area = None, -1.0
+    for i in range(0, len(tri or ()) - 8, 9):
+        a, b, c = tri[i:i + 3], tri[i + 3:i + 6], tri[i + 6:i + 9]
+        u = [b[k] - a[k] for k in range(3)]
+        v = [c[k] - a[k] for k in range(3)]
+        cross = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]]
+        size = math.sqrt(sum(x * x for x in cross))
+        if size > area:
+            area, best = size, [(a[k] + b[k] + c[k]) / 3 for k in range(3)]
+    if best is None:  # no display data: the face point nearest its box centre
+        box = sw.m0(face, "GetBox")
+        best = list(face.GetClosestPointOn((box[0] + box[3]) / 2, (box[1] + box[4]) / 2, (box[2] + box[5]) / 2))[:3]
+    return best
+
+
+def _face_info(face: Any, place: _Placement) -> dict:
+    surf = sw.m0(face, "GetSurface")
+    feat = sw.m0(face, "GetFeature")
+    info: dict = {"type": "other"}
+    if sw.invoke(surf, "IsPlane"):
+        info = {"type": "plane", "normal": _unit3(place.direction(face.Normal))}
+    elif sw.invoke(surf, "IsCylinder"):
+        p = list(surf.CylinderParams)
+        info = {"type": "cylinder", "radius_mm": round(p[6] / MM, 3), "axis": _unit3(place.direction(p[3:6])),
+                "axis_point_mm": _mm3(place.point(p[0:3]))}
+    elif sw.invoke(surf, "IsCone"):
+        p = list(surf.ConeParams)
+        info = {"type": "cone", "axis": _unit3(place.direction(p[3:6])), "apex_side_point_mm": _mm3(place.point(p[0:3]))}
+    elif sw.invoke(surf, "IsSphere"):
+        p = list(surf.SphereParams)
+        info = {"type": "sphere", "radius_mm": round(p[3] / MM, 3), "center_mm": _mm3(place.point(p[0:3]))}
+    elif sw.invoke(surf, "IsTorus"):
+        info = {"type": "torus"}
+    point = _inside_point(face)
+    info["point_mm"] = _mm3(place.point(point)) if point else None
+    info["area_mm2"] = round(sw.m0(face, "GetArea") / MM**2, 3)
+    info["feature"] = feat.Name if feat is not None else None
+    return info
+
+
+@tool
+def list_faces(feature: str = "", type: Literal["", "plane", "cylinder", "cone", "sphere", "torus", "other"] = "",
+               component: str = "", limit: int = 60) -> dict:
+    """Faces of the active part (or, in an assembly, of every component or
+    one `component`, in assembly coordinates), each with point_mm: a point
+    well inside the face to pass to fillet, sketch(face_point=...),
+    add_mate and the other tools that pick by point. Planes give their
+    outward normal, cylinders their radius and axis. Filter by the feature
+    that made the faces (names from list_features) and/or by type."""
+    doc = sw.active_doc()
+    if sw.m0(doc, "GetType") == DOC_DRAWING:
+        raise ValueError("Open the part or assembly; drawings have views, not faces")
+    faces, total = [], 0
+    for comp, body, place in _bodies_with_placement(doc, component):
+        for face in body.GetFaces() or ():
+            info = _face_info(face, place)
+            if (feature and info["feature"] != feature) or (type and info["type"] != type):
+                continue
+            total += 1
+            if len(faces) < limit:
+                if comp:
+                    info["component"] = comp
+                faces.append(info)
+    return {"faces": faces, "total": total, **({"truncated": True} if total > len(faces) else {})}
+
+
+@tool
+def list_edges(feature: str = "", type: Literal["", "line", "circle", "other"] = "", component: str = "",
+               limit: int = 80) -> dict:
+    """Edges of the active part (or of the components of an assembly, in
+    assembly coordinates) with point_mm, the edge's midpoint to pass to
+    fillet/chamfer and other edge picks, its length, and for circles the
+    centre, radius and axis. feature= keeps edges of faces that feature
+    made (e.g. the top edges of a boss)."""
+    doc = sw.active_doc()
+    if sw.m0(doc, "GetType") == DOC_DRAWING:
+        raise ValueError("Open the part or assembly; drawings have views, not edges")
+    edges, total = [], 0
+    for comp, body, place in _bodies_with_placement(doc, component):
+        for edge in body.GetEdges() or ():
+            if feature:
+                owners = {getattr(sw.m0(f, "GetFeature"), "Name", None) for f in sw.m0(edge, "GetTwoAdjacentFaces2") or () if f is not None}
+                if feature not in owners:
+                    continue
+            curve = sw.m0(edge, "GetCurve")
+            params = sw.m0(edge, "GetCurveParams2")
+            t0, t1 = params[6], params[7]
+            kind = "line" if sw.invoke(curve, "IsLine") else "circle" if sw.invoke(curve, "IsCircle") else "other"
+            if type and kind != type:
+                continue
+            total += 1
+            if len(edges) >= limit:
+                continue
+            info = {"type": kind, "point_mm": _mm3(place.point(list(curve.Evaluate2((t0 + t1) / 2, 0))[:3])),
+                    "length_mm": round(curve.GetLength3(t0, t1) / MM, 3)}
+            if kind == "line":
+                info["ends_mm"] = [_mm3(place.point(params[0:3])), _mm3(place.point(params[3:6]))]
+            elif kind == "circle":
+                c = list(curve.CircleParams)
+                info.update({"center_mm": _mm3(place.point(c[0:3])), "radius_mm": round(c[6] / MM, 3),
+                             "axis": _unit3(place.direction(c[3:6]))})
+            if comp:
+                info["component"] = comp
+            edges.append(info)
+    return {"edges": edges, "total": total, **({"truncated": True} if total > len(edges) else {})}
+
+
 @tool
 def screenshot(view: Literal["current", "front", "back", "left", "right", "top", "bottom", "isometric", "trimetric", "dimetric"] = "isometric", zoom_to_fit: bool = True) -> list:
     """Image of the active document's graphics area, optionally reoriented."""
@@ -479,10 +671,13 @@ def set_dimension(name: str, value: float, configurations: Literal["this", "all"
 
 
 @tool
-def rebuild() -> str:
-    """Force a full rebuild of the active document."""
-    _rebuild(sw.active_doc())
-    return "rebuilt"
+def rebuild() -> dict:
+    """Force a full rebuild of the active document and list the features
+    that fail (SOLIDWORKS' What's Wrong list: feature, error, warning).
+    Every other tool adds the same list as rebuild_errors when there is any."""
+    doc = sw.active_doc()
+    _rebuild(doc)
+    return {"rebuilt": sw.m0(doc, "GetTitle"), "rebuild_errors": _feature_errors(doc)}
 
 
 @tool
@@ -610,6 +805,44 @@ def custom_properties(set_values: dict[str, str] | None = None) -> dict[str, str
     for k, v in (set_values or {}).items():
         cpm.Add3(k, 30, str(v), 2)  # text, replace existing
     return {n: cpm.Get(n) for n in (sw.m0(cpm, "GetNames") or ())}
+
+
+LENGTH_UNITS = {"mm": "swMM", "cm": "swCM", "m": "swMETER", "in": "swINCHES"}
+
+
+@tool
+def document_units(length: Literal["mm", "cm", "m", "in", ""] = "", decimals: int | None = None,
+                   angle_decimals: int | None = None) -> dict:
+    """Read, and optionally change, the active document's length unit and
+    the decimal places shown for lengths and angles (values in the model
+    and the dimensions of a drawing), e.g. decimals=0 for whole-mm
+    drawings. Tools always take mm whatever the document unit is."""
+    doc = sw.active_doc()
+    ext = doc.Extension
+    pref = lambda name: sw.constant(name)  # noqa: E731
+    if length:
+        ext.SetUserPreferenceInteger(pref("swUnitSystem"), 0, pref("swUnitSystem_Custom"))
+        ext.SetUserPreferenceInteger(pref("swUnitsLinear"), 0, pref(LENGTH_UNITS[length]))
+    if decimals is not None:
+        ext.SetUserPreferenceInteger(pref("swUnitsLinearDecimalPlaces"), 0, decimals)
+        ext.SetUserPreferenceInteger(pref("swDetailingLinearDimPrecision"), 0, decimals)
+    if angle_decimals is not None:
+        ext.SetUserPreferenceInteger(pref("swUnitsAngularDecimalPlaces"), 0, angle_decimals)
+        ext.SetUserPreferenceInteger(pref("swDetailingAngularDimPrecision"), 0, angle_decimals)
+    if length or decimals is not None or angle_decimals is not None:
+        doc.ForceRebuild3(False)
+    read = lambda name: ext.GetUserPreferenceInteger(pref(name), 0)  # noqa: E731
+    unit = sw.enum_names("swLengthUnit_e").get(read("swUnitsLinear"), "")
+    result = {
+        "length": next((k for k, v in LENGTH_UNITS.items() if v == unit), unit),
+        "unit_system": sw.enum_names("swUnitSystem_e").get(read("swUnitSystem"), "").replace("swUnitSystem_", ""),
+        "decimals": read("swUnitsLinearDecimalPlaces"),
+        "dimension_decimals": read("swDetailingLinearDimPrecision"),
+        "angle_decimals": read("swUnitsAngularDecimalPlaces"),
+    }
+    if (length and result["length"] != length) or (decimals is not None and result["decimals"] != decimals):
+        result["problem"] = "SOLIDWORKS kept a different setting"
+    return result
 
 
 # --- Part modelling -------------------------------------------------------
@@ -3116,6 +3349,42 @@ def sketch_pattern(features: list[str], sketch_name: str, use_centroid: bool = T
 
 
 @tool
+def mirror_part(plane: str = "right", face_point: list[float] | None = None, break_link: bool = False) -> dict:
+    """Make the opposite-hand version of the active (saved) part as a new
+    part, mirrored about "front"/"top"/"right", a plane name or the planar
+    face at face_point. It stays linked to the original (changes follow)
+    unless break_link. The new part is active and unsaved: save it."""
+    import pythoncom
+    from win32com.client import VARIANT
+
+    doc = sw.active_doc(DOC_PART)
+    if not sw.m0(doc, "GetPathName"):
+        raise ValueError("Save the part first; the mirrored part refers to its file")
+    source = sw.m0(doc, "GetTitle")
+    doc.ClearSelection2(True)
+    if face_point:
+        sw.select_at(doc, "FACE", face_point, False)
+    else:
+        key = plane.lower()
+        _select_plane(doc, sw.standard_plane(doc, key) if key in sw.PLANE_NAMES else sw.feature(doc, plane))
+    options = 0
+    for name in ("ImportSolids", "ImportPlanes", "ImportAxes", "ImportCosmeticThreads", "ImportCustomProperties",
+                 "ImportHoleWizardData", "ImportPartMaterial"):
+        options |= sw.constant(f"swMirrorPartOptions_{name}")
+    made = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_DISPATCH, None)
+    doc.MirrorPart2(break_link, options, made)
+    new = sw.app().ActiveDoc
+    if new is None or sw.m0(new, "GetTitle") == source:
+        raise RuntimeError("SOLIDWORKS did not make the mirrored part; check the plane or face")
+    result = {"part": sw.m0(new, "GetTitle"), "mirrored_from": source}
+    props = sw.m0(new.Extension, "CreateMassProperty")
+    if props is not None:
+        result["volume_mm3"] = round(props.Volume / MM**3, 3)
+        result["center_of_mass_mm"] = _mm3(props.CenterOfMass)
+    return result
+
+
+@tool
 def mirror(features: list[str], plane: str = "right", face_point: list[float] | None = None) -> dict:
     """Mirror features (by name) about "front"/"top"/"right", a plane name,
     or the planar face at face_point (mm)."""
@@ -5291,6 +5560,67 @@ def mirror_components(components: list[str], plane: str = "right") -> dict:
 
 
 # --- Escape hatches -------------------------------------------------------
+
+
+STEP_REF = re.compile(r"^\$(\d+)((?:\.[^.]+)*)$")
+
+
+def _step_value(results: list, text: str) -> Any:
+    match = STEP_REF.match(text)
+    if not match:
+        return text
+    index = int(match.group(1))
+    if index >= len(results):
+        raise ValueError(f"{text!r} refers to step {index}, which has not run yet")
+    value = results[index]
+    for key in match.group(2).split(".")[1:]:
+        if isinstance(value, list):
+            value = value[int(key)]
+        elif isinstance(value, dict) and key in value:
+            value = value[key]
+        else:
+            raise ValueError(f"{text!r}: step {index}'s result has no {key!r}")
+    return value
+
+
+def _resolve_steps(value: Any, results: list) -> Any:
+    if isinstance(value, str):
+        return _step_value(results, value)
+    if isinstance(value, list):
+        return [_resolve_steps(v, results) for v in value]
+    if isinstance(value, dict):
+        return {k: _resolve_steps(v, results) for k, v in value.items()}
+    return value
+
+
+@tool(timeout=900)
+def run_steps(steps: list[dict], stop_on_error: bool = True) -> dict:
+    """Run several tools in one call, in order, which is much faster than a
+    call each: steps = [{"tool": "sketch", "args": {...}}, {"tool":
+    "extrude", "args": {"depth": 10}}, ...]. An argument "$N.key" is
+    replaced by `key` from step N's result (N counts from 0; keys separated
+    by dots, list positions as numbers), e.g. {"features": ["$3.feature"]}
+    or "$0.faces.2.point_mm". Returns every step's result; stops at the
+    first failing step (reported with its error) unless stop_on_error=false.
+    screenshot is left out (call it on its own)."""
+    results: list = []
+    failed = []
+    for i, step in enumerate(steps):
+        name = step.get("tool", "")
+        try:
+            fn = TOOLS.get(name)
+            if fn is None or name in ("run_steps", "screenshot"):
+                raise ValueError(f"Unknown or unsupported tool {name!r}")
+            out = fn(**_resolve_steps(step.get("args") or {}, results))
+            results.append(out)
+        except Exception as exc:
+            error = {"step": i, "tool": name, "error": f"{type(exc).__name__}: {exc}"}
+            results.append(error)
+            failed.append(error)
+            if stop_on_error:
+                break
+    done = len(results) - len(failed)
+    return {"completed": done, "of": len(steps), "results": results, **({"failed": failed} if failed else {})}
 
 
 @tool

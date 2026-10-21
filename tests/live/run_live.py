@@ -178,6 +178,40 @@ def parts() -> None:
     rp = S.reference_point([-17, 5, 0], entity="edge")
     check("reference point at the hole centre", rp["point_mm"] == [-20.0, 5.0, 0.0], str(rp))
 
+    # one run_steps call: plate, hole on the top face found by list_faces, fillet on an edge from list_edges
+    r = S.run_steps([
+        {"tool": "new_document", "args": {"kind": "part"}},
+        {"tool": "sketch", "args": {"entities": [{"type": "center_rectangle", "cx": 0, "cy": 0, "width": 60, "height": 40}], "plane": "top"}},
+        {"tool": "extrude", "args": {"depth": 10}},
+        {"tool": "list_faces", "args": {"type": "plane"}},
+        {"tool": "sketch", "args": {"entities": [{"type": "circle", "cx": 15, "cy": 0, "r": 5}], "face_point": "$3.faces.4.point_mm"}},
+        {"tool": "extrude", "args": {"depth": 10, "cut": True, "end": "through_all"}},
+        {"tool": "fillet", "args": {"radius": 5, "edge_points": [[30, 5, 20]]}},
+    ])
+    OPENED.append(r["results"][0]["title"])
+    check("run_steps ran every step", r["completed"] == r["of"] == 7, str(r.get("failed")))
+    near("run_steps model volume", volume(), 24000 - math.pi * 25 * 10 - (25 - math.pi * 25 / 4) * 10, 0.5)
+    cyl = S.list_faces(type="cylinder")["faces"]
+    hole = [f for f in cyl if f["radius_mm"] == 5.0 and f["axis_point_mm"][0] == 15.0]
+    check("list_faces finds the hole (r5 at x 15)", len(hole) == 1, str(cyl))
+    top = [f for f in S.list_faces(type="plane")["faces"] if f["normal"] == [0.0, 1.0, 0.0]]
+    check("top face point lies on the face, off the hole",
+          len(top) == 1 and top[0]["point_mm"][1] == 10.0 and math.dist(top[0]["point_mm"][::2], [15, 0]) > 5, str(top))
+    circles = S.list_edges(type="circle")["edges"]
+    check("list_edges: two hole circles and two fillet arcs", sorted(e["radius_mm"] for e in circles) == [5.0, 5.0, 5.0, 5.0], str(circles))
+    fil = [f["name"] for f in S.list_features() if f["type"] == "Fillet"][-1]
+    broken = S.set_dimension(f"D1@{fil}", 100)
+    check("a fillet too big is reported as a rebuild error", any(e["feature"] == fil for e in broken.get("rebuild_errors", [])), str(broken))
+    check("fixed again: no rebuild errors", "rebuild_errors" not in S.set_dimension(f"D1@{fil}", 5))
+    units = S.document_units(decimals=0)
+    check("document units: whole mm", units["decimals"] == 0 and units["dimension_decimals"] == 0, str(units))
+    S.save(path("lefthand.SLDPRT"))
+    com = S.model_info()["center_of_mass_mm"]
+    m = S.mirror_part()
+    OPENED.append(m["part"])
+    check("mirror_part flips the centre of mass in x", abs(m["center_of_mass_mm"][0] + com[0]) < 0.01 and abs(com[0]) > 0.1,
+          f"{com} -> {m['center_of_mass_mm']}")
+
 
 def holes() -> None:
     new()
@@ -285,6 +319,8 @@ def assembly() -> None:
     pin2 = S.insert_component(path("pin.SLDPRT"), [50, 30, 30], [0, 0, 90])["component"]
     turned = S.set_component(pin2)["y_axis"]
     check("insert turns the component (z 90: y axis -> -x)", turned == [-1.0, 0.0, 0.0], str(turned))
+    axis = S.list_faces(component=pin2, type="cylinder")["faces"][0]["axis"]
+    check("list_faces gives a turned component's axis in assembly space", abs(axis[0]) == 1.0, str(axis))
     S.set_component(pin2, rotation=[0, 0, 0])
     S.insert_component(path("rack.SLDPRT"), [0, 0, 60])
     S.add_mate("slot", [-20, 5, 4], [4, 45, 0])
