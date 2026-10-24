@@ -12,6 +12,7 @@ import contextlib
 import functools
 import glob
 import io
+import itertools
 import math
 import os
 import re
@@ -4185,20 +4186,72 @@ def measure(
     return out
 
 
+def _boxes_near(a: list[float], b: list[float], gap: float) -> bool:
+    return all(a[i] <= b[i + 3] + gap and b[i] <= a[i + 3] + gap for i in range(3))
+
+
+def _closest(doc: Any, a: Any, b: Any) -> tuple[float, list[float]]:
+    """Smallest distance (m) between two bodies and the point on the first."""
+    import pythoncom
+    from win32com.client import VARIANT
+
+    p1, p2 = (VARIANT(pythoncom.VT_BYREF | pythoncom.VT_VARIANT, None) for _ in range(2))
+    return doc.ClosestDistance(a, b, p1, p2), list(p1.value or (0, 0, 0))
+
+
+def _body_interference(doc: Any, include_touching: bool, clearance: float) -> list[dict]:
+    """Pairs of solid bodies of a multibody part that overlap (the volume
+    of their intersection, from temporary copies: the part is unchanged),
+    and with include_touching/clearance those that touch or come closer
+    than clearance mm."""
+    bodies = list(doc.GetBodies2(0, True) or ())
+    boxes = [list(b.GetBodyBox()) for b in bodies]
+    gap = mm(clearance)
+    out = []
+    for i, j in itertools.combinations(range(len(bodies)), 2):
+        if not _boxes_near(boxes[i], boxes[j], gap + 1e-9):
+            continue
+        a, b = bodies[i], bodies[j]
+        result = sw.m0(a, "Copy").Operations2(sw.constant("SWBODYINTERSECT"), sw.m0(b, "Copy"), 0)
+        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+            result = result[0]  # (bodies, error code) under late binding
+        pieces = [p.GetMassProperties(1.0) for p in result or ()]
+        volume = sum(p[3] for p in pieces)
+        names = [a.Name, b.Name]
+        if volume > 1e-15:  # > 0.000001 mm3
+            centre = [sum(p[3] * p[k] for p in pieces) / volume for k in range(3)]
+            out.append({"bodies": names, "volume_mm3": round(volume / MM**3, 3), "center_mm": _mm3(centre)})
+        elif include_touching or gap > 0:
+            distance, at = _closest(doc, a, b)
+            if distance <= 1e-9 and include_touching:
+                out.append({"bodies": names, "volume_mm3": 0.0, "touching": True, "at_mm": _mm3(at)})
+            elif 1e-9 < distance < gap:
+                out.append({"bodies": names, "gap_mm": round(distance / MM, 4), "at_mm": _mm3(at)})
+    return out
+
+
 @tool
-def check_interference() -> list[dict]:
-    """Interferences between components of the active assembly (touching
-    faces are not counted), with the overlap volume."""
-    asm = sw.active_doc(DOC_ASSEMBLY)
-    idm = asm.InterferenceDetectionManager
-    idm.TreatCoincidenceAsInterference = False
+def check_interference(include_touching: bool = False, clearance: float = 0.0) -> list[dict]:
+    """Interferences of the active document with the overlap volume:
+    between the components of an assembly, or between the solid bodies of
+    a multibody part (with the overlap's centre). include_touching also
+    lists pairs that only touch (volume 0); in a part, clearance (mm) also
+    lists pairs closer than that with their gap."""
+    doc = sw.active_doc()
+    kind = sw.m0(doc, "GetType")
+    if kind == DOC_PART:
+        return _body_interference(doc, include_touching, clearance)
+    if kind != DOC_ASSEMBLY:
+        raise ValueError("Activate a part (bodies) or an assembly (components)")
+    idm = doc.InterferenceDetectionManager
+    idm.TreatCoincidenceAsInterference = include_touching
     out = []
     try:
         for intf in sw.m0(idm, "GetInterferences") or ():
-            out.append({
-                "components": [c.Name2 for c in (intf.Components or ())],
-                "volume_mm3": round(intf.Volume / MM**3, 3),
-            })
+            hit = {"components": [c.Name2 for c in (intf.Components or ())], "volume_mm3": round(intf.Volume / MM**3, 3)}
+            if hit["volume_mm3"] == 0:
+                hit["touching"] = True
+            out.append(hit)
     finally:
         sw.m0(idm, "Done")
     return out

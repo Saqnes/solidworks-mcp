@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "solidworks-mcp",
   "display_name": "SOLIDWORKS",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "SOLIDWORKS(2025)를 Claude에서 조작합니다: 파트 모델링, 판금, 용접 구조물, 어셈블리 메이트, 도면과 PDF/DXF 내보내기.",
   "long_description": "실행 중인 SOLIDWORKS를 COM API로 조작하는 MCP 서버입니다. 스케치·돌출·구멍 가공 마법사·필렛, 판금과 용접 구조물, 어셈블리 메이트(슬롯·힌지·기어 등), 도면(치수·공차·표제란·BOM)과 PDF/DXF/STEP 내보내기를 도구 130여 개로 제공합니다. 한글 UI와 Windows 전용입니다. 처음 켤 때 Python 패키지를 내려받느라 1~2분 걸릴 수 있습니다.",
   "author": {
@@ -124,7 +124,7 @@
     },
     {
       "name": "check_interference",
-      "description": "Interferences between components of the active assembly (touching faces are not counted), with the overlap volume."
+      "description": "Interferences of the active document with the overlap volume:"
     },
     {
       "name": "circular_pattern",

@@ -160,6 +160,20 @@ def parts() -> None:
     S.combine_bodies("subtract", [-20, 5, 20], [[38, 20, 0]])
     check("combine subtract", len(S.list_bodies()) == 1)
 
+    # four 20 mm cubes as separate bodies: B overlaps A by 10 mm, C touches A, D is far off
+    new()
+    for cx in (0, 10, -20, 80):
+        S.sketch([{"type": "center_rectangle", "cx": cx, "cy": 0, "width": 20, "height": 20}], plane="top", dimension=False)
+        S.extrude(depth=20, merge=False)
+    hits = S.check_interference()
+    check("multibody interference: one overlap", len(hits) == 1, str(hits))
+    near("multibody overlap volume (10 x 20 x 20)", hits[0]["volume_mm3"] if hits else None, 4000, 0.01)
+    check("overlap centre", hits and hits[0]["center_mm"] == [5.0, 10.0, 0.0], str(hits))
+    touching = [h for h in S.check_interference(include_touching=True) if h.get("touching")]
+    check("include_touching finds the touching pair", len(touching) == 1, str(touching))
+    close = [h for h in S.check_interference(clearance=15) if "gap_mm" in h]
+    check("clearance finds the 10 mm gap", len(close) == 1 and close[0]["gap_mm"] == 10.0, str(close))
+
     new()
     h = S.helix(pitch=10, revolutions=5, diameter=20)
     S.sweep(h["feature"], circle_diameter=2)

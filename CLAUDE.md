@@ -210,6 +210,14 @@ user in Korean.
     the curve mark 1 + features mark 4 (equal spacing: pass the curve
     length). `sw.select_at`/list_faces search surface bodies too
     (`sw.solid_and_surface_bodies`): after delete_face a part has none.
+29. Multibody interference: the assembly InterferenceDetectionManager has
+    no part counterpart, so check_interference intersects temporary copies
+    (IBody2.Copy via `sw.m0`, then Operations2(SWBODYINTERSECT, tool, 0))
+    and sums the pieces' volume; the part is not changed. Operations2's
+    ByRef error code must be passed as a plain 0 (an out_int VARIANT raises
+    TypeError) and the result may come back as (bodies, code). Touching
+    pairs intersect to nothing: IModelDoc2.ClosestDistance(a, b, p1, p2)
+    with VT_BYREF|VT_VARIANT points gives the gap (0 = touching).
 
 ## Verified on the real SOLIDWORKS
 
@@ -234,7 +242,9 @@ functions, each result checked (volumes, positions, PDFs rendered):
   document_units, mirror_part, insert_bends, component configurations,
   the .mcpb bundle (unpacked and run through uv); surfaces (extrude,
   planar, offset, knit to solid, thicken, delete face), split_line,
-  fill_pattern (seed features and seed cut), curve_pattern (edge, sketch).
+  fill_pattern (seed features and seed cut), curve_pattern (edge, sketch),
+  check_interference for multibody parts (overlap volume and centre,
+  touching, clearance) and touching components.
 - Sheet metal: base flange, edge_flange (90° and 60°), miter_flange along
   two edges, hem.
 - Weldments: structural_member (iso square tube, mitre corners),
