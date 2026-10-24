@@ -32,7 +32,10 @@ user in Korean.
   the fix. Push to `main`.
 - Install: `install.cmd` → `install.ps1` (venv, pip, registration, check);
   `doctor.py` checks the setup and merges the Claude Desktop config
-  (`--register` / `--unregister`, backups, Store-app path too). Test the
+  (`--register` / `--unregister`, backups, Store-app path too). Newer
+  Claude apps keep it in `%LOCALAPPDATA%\Claude-Data\<install id>\` and
+  leave a `.user-data-left.*` marker in the old folders, which are then
+  skipped (registering there did nothing). Test the
   installer on a copy of the repo with APPDATA/LOCALAPPDATA pointed at a
   scratch folder, never against the real config. `.ps1` files must stay
   UTF-8 *with* BOM (Windows PowerShell 5.1 misreads Korean otherwise) and

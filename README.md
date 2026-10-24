@@ -58,7 +58,7 @@ Windows에서 "Beta: 세계 언어 지원을 위해 Unicode UTF-8 사용"이 켜
 2. **설치**: 그 폴더의 `install.cmd`를 더블클릭합니다. 30초~1분쯤 걸리며 아래를 알아서 합니다.
    - Python 3.11+ 찾기. 없으면 **winget으로 Python 3.12를 설치할지 물어보고**(Enter = 예) 설치합니다.
    - `.venv` 가상환경 → 패키지 설치(mcp, pywin32, pillow)
-   - Claude Desktop 설정(`claude_desktop_config.json`)에 `solidworks` 등록. 다른 서버·설정은 그대로 두고, 바꾸기 전에 `.bak` 백업을 만듭니다. Microsoft Store판 Claude도 지원합니다.
+   - Claude Desktop 설정(`claude_desktop_config.json`)에 `solidworks` 등록. 다른 서버·설정은 그대로 두고, 바꾸기 전에 `.bak` 백업을 만듭니다. 새 버전 Claude가 쓰는 `%LOCALAPPDATA%\Claude-Data\…` 위치와 Microsoft Store판도 찾아서 씁니다.
    - `claude` 명령(Claude Code)이 있으면 Claude Code에도 등록
    - 설치 점검: Python, 패키지, SOLIDWORKS COM 등록, 기본 템플릿, PDF 프린터, 등록 상태를 `[ OK ]` / `[주의]` / `[실패]`로 보여 줍니다.
 3. **Claude Desktop을 완전히 종료**(작업 표시줄 트레이 아이콘 > 종료)했다가 다시 켭니다. 창만 닫으면 서버가 다시 읽히지 않습니다.
@@ -96,7 +96,7 @@ python -m venv .venv
 .venv\Scripts\pip install -e .
 ```
 
-`%APPDATA%\Claude\claude_desktop_config.json`의 `mcpServers`에 추가:
+`claude_desktop_config.json`(새 버전 Claude: `%LOCALAPPDATA%\Claude-Data\<설치 ID>\`, 예전 버전: `%APPDATA%\Claude\`)의 `mcpServers`에 추가:
 
 ```json
 "solidworks": {

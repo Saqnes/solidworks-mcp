@@ -43,19 +43,25 @@ def venv_python() -> str:
 
 
 def desktop_configs(existing_only: bool = False) -> list[str]:
-    """Claude Desktop config files: the classic one under %APPDATA% and the
-    Microsoft Store (MSIX) one, whose folder only exists for Store installs."""
-    paths = [os.path.expandvars(r"%APPDATA%\Claude\claude_desktop_config.json")]
-    paths += glob.glob(os.path.expandvars(r"%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude_desktop_config.json"))
-    store_dirs = glob.glob(os.path.expandvars(r"%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude"))
-    for d in store_dirs:
-        p = os.path.join(d, "claude_desktop_config.json")
-        if p not in paths:
-            paths.append(p)
+    """Claude Desktop config files. Newer Claude apps keep their data in
+    %LOCALAPPDATA%\\Claude-Data\\<install id>\\ and leave a
+    ".user-data-left.*" marker in the folders they moved away from; older
+    ones use %APPDATA%\\Claude or, for Microsoft Store installs, the
+    package's LocalCache\\Roaming\\Claude."""
+    paths = []
+    for d in glob.glob(os.path.expandvars(r"%LOCALAPPDATA%\Claude-Data\*")):
+        if os.path.isdir(d):
+            paths.append(os.path.join(d, "claude_desktop_config.json"))
+    old = [os.path.expandvars(r"%APPDATA%\Claude")]
+    old += glob.glob(os.path.expandvars(r"%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude"))
+    for d in old:
+        if not glob.glob(os.path.join(d, ".user-data-left.*")):  # the app no longer reads it
+            paths.append(os.path.join(d, "claude_desktop_config.json"))
     if existing_only:
         return [p for p in paths if os.path.exists(p)]
-    # write the classic path, plus the Store path when Claude is a Store install
-    return [p for p in paths if os.path.exists(p) or os.path.isdir(os.path.dirname(p))] or paths[:1]
+    # write every config Claude may read: existing ones and those whose folder exists
+    return [p for p in paths if os.path.exists(p) or os.path.isdir(os.path.dirname(p))] or paths[:1] or [
+        os.path.join(old[0], "claude_desktop_config.json")]
 
 
 def load_config(path: str) -> dict:
