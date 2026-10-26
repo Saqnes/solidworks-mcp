@@ -174,6 +174,13 @@ def parts() -> None:
     close = [h for h in S.check_interference(clearance=15) if "gap_mm" in h]
     check("clearance finds the 10 mm gap", len(close) == 1 and close[0]["gap_mm"] == 10.0, str(close))
 
+    # compact mode's helpers (plain functions in full mode too)
+    described = S.tool_help(names=["extrude"])
+    check("tool_help gives extrude's arguments", "depth" in described["extrude"]["arguments"]["properties"])
+    near("call_tool runs an operation", S.call_tool("model_info")["volume_mm3"], 4 * 8000, 0.01)
+    blocked = S.run_steps([{"tool": "run_api_script", "args": {"code": "result = 1"}}])
+    check("run_steps refuses the script tools", bool(blocked.get("failed")) and "own tool" in blocked["failed"][0]["error"], str(blocked))
+
     new()
     h = S.helix(pitch=10, revolutions=5, diameter=20)
     S.sweep(h["feature"], circle_diameter=2)

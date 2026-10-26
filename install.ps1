@@ -2,10 +2,10 @@
   solidworks-mcp 설치 / 업데이트
 
   install.cmd 를 더블클릭하거나 PowerShell에서:
-      powershell -ExecutionPolicy Bypass -File install.ps1 [-Update] [-Yes] [-NoDesktop] [-NoClaudeCode] [-Python <python.exe>]
+      powershell -ExecutionPolicy Bypass -File install.ps1 [-Update] [-Yes] [-NoDesktop] [-NoClaudeCode] [-NoCodex] [-Python <python.exe>]
 
   하는 일: Python 3.11+ 찾기(없으면 묻고 winget으로 설치) -> .venv 만들기 -> 패키지 설치 -> Claude Desktop 설정에 등록
-           -> (claude CLI가 있으면) Claude Code에 등록 -> 설치 점검(doctor.py)
+           -> (claude CLI가 있으면) Claude Code에 등록 -> (Codex가 있으면) Codex에 등록 -> 설치 점검(doctor.py)
   다시 실행해도 안전합니다. -Update 는 먼저 git pull 로 최신 코드를 받습니다.
 #>
 param(
@@ -13,6 +13,7 @@ param(
     [switch]$Yes,
     [switch]$NoDesktop,
     [switch]$NoClaudeCode,
+    [switch]$NoCodex,
     [string]$Python = ""
 )
 
@@ -130,6 +131,14 @@ if (-not $NoClaudeCode) {
         & claude mcp get solidworks *> $null
         if ($LASTEXITCODE -eq 0) { & claude mcp remove solidworks --scope user *> $null }
         & claude mcp add solidworks --scope user -- $VenvPy $Server
+    }
+}
+
+if (-not $NoCodex) {
+    $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
+    if (Test-Path $codexHome) {
+        Step "Codex(OpenAI)에 등록 (간결 모드)"
+        & $VenvPy (Join-Path $Root "doctor.py") --register-codex
     }
 }
 

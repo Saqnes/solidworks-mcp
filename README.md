@@ -68,7 +68,7 @@ Windows에서 "Beta: 세계 언어 지원을 위해 Unicode UTF-8 사용"이 켜
 | 업데이트 | `update.cmd` 더블클릭(`git pull` 후 재설치·점검). ZIP으로 받았다면 새 ZIP을 같은 폴더에 덮어쓰고 `install.cmd` |
 | 점검만 다시 | 폴더에서 `.venv\Scripts\python doctor.py` |
 | 제거 | `.venv\Scripts\python doctor.py --unregister`(Claude Desktop), `claude mcp remove solidworks --scope user`(Claude Code), 그다음 폴더 삭제 |
-| 옵션 | `powershell -ExecutionPolicy Bypass -File install.ps1 -Yes -NoDesktop -NoClaudeCode -Python C:\경로\python.exe` (`-Yes`: 묻지 않고 Python 설치) |
+| 옵션 | `powershell -ExecutionPolicy Bypass -File install.ps1 -Yes -NoDesktop -NoClaudeCode -NoCodex -Python C:\경로\python.exe` (`-Yes`: 묻지 않고 Python 설치) |
 | 다른 사람에게 줄 `.mcpb` 만들기 | `.venv\Scripts\python scripts\build_mcpb.py` (Node.js 필요, `dist\`에 생김) |
 
 SOLIDWORKS가 실행 중이면 그 창에 연결하고, 실행 중이 아니면 도구를 처음 쓸 때 새로 띄웁니다.
@@ -111,6 +111,32 @@ Claude Code:
 claude mcp add solidworks --scope user -- C:\mcp\solidworks-mcp\.venv\Scripts\python.exe C:\mcp\solidworks-mcp\server.py
 ```
 </details>
+
+## GPT(Codex·ChatGPT)에서 쓰기
+
+이 서버는 MCP 표준이라 OpenAI 쪽에서도 쓸 수 있습니다. 다만 OpenAI 모델은 요청 하나에 도구를 128개까지만 받는데 이 서버는 130개가 넘어서, GPT에서는 **간결 모드**로 씁니다. 간결 모드에서는 `status`, `screenshot`, `run_steps`, `tool_help`(기능 목록·인자 설명), `call_tool`(기능 실행), `run_api_script`, `run_macro` 7개만 보이고, 나머지 기능은 모두 `call_tool`과 `run_steps`로 씁니다. GPT가 먼저 `tool_help`로 목록을 읽고 필요한 기능을 부릅니다.
+
+### Codex (데스크톱 앱·CLI)
+
+- `install.cmd`가 Codex가 깔려 있으면 같이 등록합니다(`%USERPROFILE%\.codex\config.toml`, 바꾸기 전에 백업). 직접 하려면 `.venv\Scripts\python doctor.py --register-codex`, 지우려면 `--unregister-codex`.
+- 일반 도구는 묻지 않고 실행하고, 임의 코드를 실행하는 `run_api_script`·`run_macro`만 매번 확인을 받습니다.
+- 등록 뒤 Codex 앱을 다시 시작하면 됩니다. 이 PC에서 Codex(GPT)가 60×40×10 판에 지름 10 구멍을 뚫고 부피 23,214.602 mm³(계산값과 같음)를 보고하는 것까지 확인했습니다.
+
+### ChatGPT (웹·데스크톱)
+
+ChatGPT는 PC에서 서버를 직접 실행하지 못하고, OpenAI의 **Secure MCP Tunnel**로 연결합니다. 사용자 정의 MCP 서버를 쓸 수 있는 요금제와 OpenAI Platform 조직이 필요하며, 아래 순서는 OpenAI 문서대로 정리한 것으로 아직 직접 확인하지 않았습니다.
+
+1. [platform.openai.com > Settings > Tunnels](https://platform.openai.com/settings/organization/tunnels)에서 터널을 만들고 `tunnel_id`와 런타임 API 키(Tunnels **Read + Use** 권한)를 받습니다.
+2. [openai/tunnel-client](https://github.com/openai/tunnel-client/releases/latest) 최신 버전을 받아 명령 프롬프트에서 실행합니다(키는 남에게 보이지 않게):
+   ```
+   set CONTROL_PLANE_API_KEY=sk-...
+   tunnel-client init --sample sample_mcp_stdio_local --profile solidworks --tunnel-id <tunnel_id> --mcp-command "C:\mcp\solidworks-mcp\.venv\Scripts\python.exe C:\mcp\solidworks-mcp\server.py --compact"
+   tunnel-client run --profile solidworks
+   ```
+3. ChatGPT의 **Plugins > + > Add custom MCP server**에서 Connection을 **Tunnel**로 두고 그 터널을 고릅니다.
+4. `tunnel-client`가 켜져 있는 동안만 동작하고, 도구 하나는 120초 안에 끝나야 합니다(터널 한도).
+
+Claude에서도 간결 모드를 켜면 매 메시지에 읽는 도구 설명이 8만 자에서 3천 자로 줄어 긴 대화에서 토큰을 아낄 수 있습니다(확장 설정의 "간결 모드" 또는 환경변수 `SWMCP_COMPACT=1`).
 
 ## 빠르게 쓰는 요령
 

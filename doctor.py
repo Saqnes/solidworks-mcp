@@ -3,6 +3,7 @@
     python doctor.py               check this PC (Python, packages, SOLIDWORKS, PDF printer, Claude config)
     python doctor.py --register    add/update the "solidworks" server in Claude Desktop's config
     python doctor.py --unregister  remove it again
+    python doctor.py --register-codex / --unregister-codex   the same for Codex (OpenAI)
 
 The check never starts SOLIDWORKS; it only looks at a running instance.
 The config is merged (other servers and settings are kept) and backed up
@@ -14,6 +15,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -73,16 +75,20 @@ def load_config(path: str) -> dict:
     return json.loads(text) if text else {}
 
 
+def _backup(path: str) -> None:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup, n = f"{path}.{stamp}.bak", 1
+    while os.path.exists(backup):  # two changes in the same second keep both backups
+        n += 1
+        backup = f"{path}.{stamp}-{n}.bak"
+    shutil.copy2(path, backup)
+    print(f"       백업: {backup}")
+
+
 def save_config(path: str, cfg: dict) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if os.path.exists(path):
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        backup, n = f"{path}.{stamp}.bak", 1
-        while os.path.exists(backup):  # two changes in the same second keep both backups
-            n += 1
-            backup = f"{path}.{stamp}-{n}.bak"
-        shutil.copy2(path, backup)
-        print(f"       백업: {backup}")
+        _backup(path)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as f:  # UTF-8 without BOM, as Claude writes it
         json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -126,6 +132,129 @@ def unregister() -> int:
             save_config(path, cfg)
             report("ok", f"Claude Desktop에서 제거: {path}")
     return 0
+
+
+# --- Codex (OpenAI's agent: desktop app and CLI) -----------------------------
+
+
+def codex_config() -> str:
+    """Codex's config.toml (shared by the Codex desktop app and the CLI)."""
+    home = os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+    return os.path.join(home, "config.toml")
+
+
+def _toml_str(value: str) -> str:
+    # literal string: Windows backslashes stay as they are (no escaping needed)
+    return f"'{value}'" if "'" not in value and "\n" not in value else json.dumps(value)
+
+
+def codex_entry() -> str:
+    """The [mcp_servers.solidworks] table. Compact mode: OpenAI models take at
+    most 128 tools per request and this server has more. Its tools run
+    without asking (codex exec, with approval policy "never", refuses tools
+    that need approval), except the two that run arbitrary code."""
+    return (
+        f"[mcp_servers.{NAME}]\n"
+        f"command = {_toml_str(venv_python())}\n"
+        f"args = [{_toml_str(SERVER)}]\n"
+        "startup_timeout_sec = 30\n"
+        "tool_timeout_sec = 600\n"
+        "default_tools_approval_mode = 'approve'\n"
+        "\n"
+        f"[mcp_servers.{NAME}.env]\n"
+        "SWMCP_TOOLS = 'compact'\n"
+        "\n"
+        f"[mcp_servers.{NAME}.tools.run_api_script]\n"  # arbitrary code: ask every time
+        "approval_mode = 'prompt'\n"
+        "\n"
+        f"[mcp_servers.{NAME}.tools.run_macro]\n"
+        "approval_mode = 'prompt'\n"
+    )
+
+
+def _without_codex_entry(text: str) -> str:
+    """config.toml text without our table and its sub-tables (everything else
+    is kept as it is, comments included)."""
+    ours = re.compile(rf"^\[mcp_servers\.(?:{NAME}|\"{NAME}\")(?:\.[^\]]*)?\]\s*(#.*)?$")
+    out, skipping = [], False
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            skipping = bool(ours.match(stripped))
+        if not skipping:
+            out.append(line)
+    return "".join(out)
+
+
+def _codex_registered(path: str) -> dict | None:
+    import tomllib
+
+    with open(path, "rb") as f:
+        return tomllib.load(f).get("mcp_servers", {}).get(NAME)
+
+
+def _write_codex(path: str, text: str) -> None:
+    import tomllib
+
+    tomllib.loads(text)  # never write a config Codex could not read
+    if os.path.exists(path):
+        _backup(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def register_codex() -> int:
+    path = codex_config()
+    if not os.path.isdir(os.path.dirname(path)):
+        report("warn", "Codex가 설치되어 있지 않음", f"{os.path.dirname(path)} 없음")
+        return 1
+    text = open(path, encoding="utf-8").read() if os.path.exists(path) else ""
+    newline = "\r\n" if "\r\n" in text else "\n"
+    kept = _without_codex_entry(text).replace("\r\n", "\n").rstrip("\n")
+    new = (kept + "\n\n" if kept else "") + codex_entry()
+    if new.replace("\n", newline) == text:
+        report("ok", f"Codex에 이미 등록됨: {path}")
+        return 0
+    try:
+        _write_codex(path, new.replace("\n", newline))
+    except Exception as exc:
+        report("fail", f"Codex 설정을 쓰지 못함: {path}", f"{type(exc).__name__}: {exc}")
+        return 1
+    report("ok", f"Codex에 등록(간결 모드): {path}")
+    report("info", "Codex 앱을 다시 시작하면 'solidworks' 도구가 보입니다")
+    return 0
+
+
+def unregister_codex() -> int:
+    path = codex_config()
+    if os.path.exists(path):
+        text = open(path, encoding="utf-8").read()
+        newline = "\r\n" if "\r\n" in text else "\n"
+        kept = _without_codex_entry(text)
+        if kept != text:
+            _write_codex(path, kept.rstrip("\r\n") + newline if kept.strip() else "")
+            report("ok", f"Codex에서 제거: {path}")
+    return 0
+
+
+def check_codex() -> None:
+    path = codex_config()
+    if not os.path.isdir(os.path.dirname(path)):
+        return  # no Codex on this PC: nothing to say
+    try:
+        entry = _codex_registered(path) if os.path.exists(path) else None
+    except Exception as exc:
+        report("fail", f"Codex 설정을 읽지 못함: {path}", str(exc))
+        return
+    if not entry:
+        report("info", "Codex(OpenAI)에는 미등록", "python doctor.py --register-codex")
+    elif os.path.normcase(entry.get("command", "")) != os.path.normcase(venv_python()):
+        report("warn", f"Codex의 '{NAME}'가 다른 경로를 가리킴", f"{entry.get('command')}; '--register-codex'로 고칩니다")
+    else:
+        report("ok", "Codex에 등록됨", f"{path} (도구 모드: {entry.get('env', {}).get('SWMCP_TOOLS', 'all')})")
 
 
 # --- Checks ------------------------------------------------------------------
@@ -289,6 +418,7 @@ def check() -> int:
     check_solidworks()
     check_pdf()
     check_registration()
+    check_codex()
     fails = sum(1 for s, *_ in results if s == "fail")
     warns = sum(1 for s, *_ in results if s == "warn")
     print(f"\n결과: 실패 {fails}, 주의 {warns}")
@@ -306,6 +436,10 @@ def main(argv: list[str] | None = None) -> int:
         return register()
     if "--unregister" in args:
         return unregister()
+    if "--register-codex" in args:
+        return register_codex()
+    if "--unregister-codex" in args:
+        return unregister_codex()
     return check()
 
 

@@ -30,9 +30,28 @@ from mcp.server.mcpserver.exceptions import ToolError
 import sw
 from sw import DOC_ASSEMBLY, DOC_DRAWING, DOC_PART, MM, call, deg, mm
 
+# "compact" exposes only a handful of tools and reaches the rest through
+# call_tool/run_steps: for clients with a tool limit (OpenAI models take at
+# most 128 tools per request; this server has more) or to keep every
+# message small. SWMCP_TOOLS=compact or `server.py --compact`.
+import sys as _sys
+
+TOOLSET = "compact" if "--compact" in _sys.argv[1:] or os.environ.get("SWMCP_COMPACT", "").strip().lower() in (
+    "1", "true", "yes") else os.environ.get("SWMCP_TOOLS", "all").strip().lower()
+# tools that run arbitrary code: always their own tool (so a client can ask before each
+# call), never reachable through call_tool or run_steps
+SCRIPT_TOOLS = {"run_api_script", "run_macro"}
+COMPACT_TOOLS = {"status", "tool_help", "call_tool", "run_steps", "screenshot"} | SCRIPT_TOOLS
+COMPACT_NOTE = (
+    "This server runs in compact mode: besides status, screenshot and run_steps, every "
+    "operation (sketch, extrude, fillet, add_mate, make_drawing, export, ...) is called "
+    "through call_tool(name, args). Start with tool_help() for the list of operations, "
+    "then tool_help(names=[...]) for the arguments of the ones you need.\n"
+)
+
 mcp = MCPServer(
     "solidworks",
-    instructions=(
+    instructions=(COMPACT_NOTE if TOOLSET == "compact" else "") + (
         "Drives SOLIDWORKS via its API. Units: millimetres and degrees; points are model "
         "coordinates [x, y, z] in mm.\n"
         "Parts: status -> new_document or open_document -> sketch -> extrude/revolve/hole/... "
@@ -58,10 +77,12 @@ mcp = MCPServer(
 )
 
 
-def tool(fn=None, *, timeout: float | None = None):
+def tool(fn=None, *, timeout: float | None = None, compact_only: bool = False):
     """Register fn as a tool. Its body runs on the COM thread, and any failure
     (including COM errors and timeouts) comes back to the agent as a
-    readable error. Long-running tools pass a larger timeout (seconds)."""
+    readable error. Long-running tools pass a larger timeout (seconds). In
+    compact mode only COMPACT_TOOLS are exposed (the rest stay callable
+    through call_tool); compact_only tools exist only in that mode."""
 
     def register(fn):
         @functools.wraps(fn)
@@ -73,7 +94,12 @@ def tool(fn=None, *, timeout: float | None = None):
             except Exception as exc:
                 raise ToolError(f"{type(exc).__name__}: {exc}") from exc
 
-        TOOLS[fn.__name__] = fn
+        if not compact_only:
+            TOOLS[fn.__name__] = fn
+        if TOOLSET == "compact" and fn.__name__ not in COMPACT_TOOLS:
+            return wrapper
+        if compact_only and TOOLSET != "compact":
+            return wrapper
         return mcp.tool()(wrapper)
 
     return register(fn) if fn is not None else register
@@ -6023,8 +6049,9 @@ def run_steps(steps: list[dict], stop_on_error: bool = True) -> dict:
         name = step.get("tool", "")
         try:
             fn = TOOLS.get(name)
-            if fn is None or name in ("run_steps", "screenshot"):
-                raise ValueError(f"Unknown or unsupported tool {name!r}")
+            if fn is None or name in ("run_steps", "screenshot") or name in SCRIPT_TOOLS:
+                raise ValueError(f"Unknown or unsupported tool {name!r}" + (
+                    "; call it as its own tool" if name in SCRIPT_TOOLS else ""))
             out = fn(**_resolve_steps(step.get("args") or {}, results))
             results.append(out)
         except Exception as exc:
@@ -6035,6 +6062,63 @@ def run_steps(steps: list[dict], stop_on_error: bool = True) -> dict:
                 break
     done = len(results) - len(failed)
     return {"completed": done, "of": len(steps), "results": results, **({"failed": failed} if failed else {})}
+
+
+def _tool_sections() -> dict[str, str]:
+    """Tool name -> the "# --- Section ---" heading it sits under in this file."""
+    lines = Path(__file__).read_text(encoding="utf-8").splitlines()
+    heads = [(i + 1, m.group(1)) for i, line in enumerate(lines) if (m := re.match(r"# --- (.+?) -+\s*$", line))]
+    out = {}
+    for name, fn in TOOLS.items():
+        first = fn.__code__.co_firstlineno
+        out[name] = next((title for line, title in reversed(heads) if line < first), "Other")
+    return out
+
+
+def _summary(fn: Any) -> str:
+    text = " ".join((fn.__doc__ or "").split())
+    m = re.match(r"(.+?[.:])(\s|$)", text)
+    return (m.group(1) if m else text)[:160]
+
+
+@tool(compact_only=True)
+def tool_help(names: list[str] | None = None, search: str = "") -> dict:
+    """The operations call_tool and run_steps can run. Without arguments:
+    every operation's name and one line, grouped by area. search: only
+    those whose name or description mentions it. names: the full
+    description and argument schema of each named operation."""
+    from mcp.server.mcpserver.tools.base import Tool
+
+    if names:
+        out = {}
+        for name in names:
+            fn = TOOLS.get(name)
+            if fn is None:
+                out[name] = "unknown operation; call tool_help() for the list"
+                continue
+            out[name] = {"description": " ".join((fn.__doc__ or "").split()),
+                         "arguments": _compact(Tool.from_function(fn).parameters)}
+        return out
+    sections: dict[str, dict[str, str]] = {}
+    word = search.lower()
+    for name, section in sorted(_tool_sections().items(), key=lambda kv: (kv[1], kv[0])):
+        fn = TOOLS[name]
+        if word and word not in name.lower() and word not in (fn.__doc__ or "").lower():
+            continue
+        sections.setdefault(section, {})[name] = _summary(fn)
+    return {"operations": sections, "next": "tool_help(names=[...]) for arguments, then call_tool(name, args)"}
+
+
+@tool(compact_only=True, timeout=900)
+def call_tool(name: str, args: dict | None = None) -> Any:
+    """Run one operation from tool_help with its arguments as an object, e.g.
+    call_tool("extrude", {"depth": 10}). Several in a row: run_steps."""
+    fn = TOOLS.get(name)
+    direct = {"run_steps", "screenshot"} | SCRIPT_TOOLS
+    if fn is None or name in direct:
+        raise ValueError(f"Unknown operation {name!r}" + ("; call it as its own tool" if name in direct else
+                                                         "; call tool_help() for the list"))
+    return fn(**(args or {}))
 
 
 @tool
@@ -6104,7 +6188,7 @@ _compact_tool_schemas()
 def main() -> None:
     import sys
 
-    if any(a in sys.argv[1:] for a in ("--check", "--register", "--unregister")):
+    if any(a in sys.argv[1:] for a in ("--check", "--register", "--unregister", "--register-codex", "--unregister-codex")):
         import doctor  # setup check / Claude Desktop registration, see doctor.py
 
         sys.exit(doctor.main([a for a in sys.argv[1:] if a != "--check"]))

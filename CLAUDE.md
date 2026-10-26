@@ -221,6 +221,25 @@ user in Korean.
     TypeError) and the result may come back as (bodies, code). Touching
     pairs intersect to nothing: IModelDoc2.ClosestDistance(a, b, p1, p2)
     with VT_BYREF|VT_VARIANT points gives the gap (0 = touching).
+30. GPT / OpenAI: OpenAI models take at most 128 tools per request (this
+    server has 136) and Codex's tool_search can miss deferred MCP tools, so
+    OpenAI clients get compact mode (SWMCP_TOOLS=compact, SWMCP_COMPACT=1
+    or `server.py --compact`): status, screenshot, run_steps, tool_help,
+    call_tool and the two script tools; every other tool stays reachable
+    through call_tool/run_steps (TOOLS). run_api_script/run_macro are never
+    reachable through call_tool or run_steps, so a client can confirm them
+    on their own. `doctor.py --register-codex` writes
+    [mcp_servers.solidworks] into $CODEX_HOME/config.toml (default
+    ~/.codex, read back with `codex mcp get`) with
+    default_tools_approval_mode 'approve' (`codex exec` runs with approval
+    policy never and refuses tools that need approval) and 'prompt' for the
+    script tools. Test with the Codex app's CLI
+    (%LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\codex.exe exec --json -c
+    mcp_servers.solidworks.command=... ) without touching the config; from
+    Git Bash give paths with forward slashes (backslashes arrive halved)
+    and stdin from /dev/null (it waits for input otherwise). ChatGPT only
+    reaches local servers through OpenAI's Secure MCP Tunnel (tunnel-client
+    runs `server.py --compact` over stdio): documented, not tested.
 
 ## Verified on the real SOLIDWORKS
 
@@ -247,7 +266,9 @@ functions, each result checked (volumes, positions, PDFs rendered):
   planar, offset, knit to solid, thicken, delete face), split_line,
   fill_pattern (seed features and seed cut), curve_pattern (edge, sketch),
   check_interference for multibody parts (overlap volume and centre,
-  touching, clearance) and touching components.
+  touching, clearance) and touching components; compact mode driven by
+  Codex/GPT end to end (60x40x10 plate with a 10 mm hole, volume checked),
+  doctor --register-codex / install.ps1 Codex registration.
 - Sheet metal: base flange, edge_flange (90° and 60°), miter_flange along
   two edges, hem.
 - Weldments: structural_member (iso square tube, mitre corners),
